@@ -11,7 +11,14 @@ from google.auth.transport.requests import Request
 # MCP
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("google-ads-server")
+mcp = FastMCP(
+    "google-ads-server",
+    dependencies=[
+        "google-auth-oauthlib",
+        "google-auth",
+        "requests"
+    ]
+)
 
 # Constants and configuration
 SCOPES = ['https://www.googleapis.com/auth/adwords']
@@ -102,7 +109,15 @@ def get_headers(creds):
 
 @mcp.tool()
 async def list_accounts() -> str:
-    """Lists all accessible Google Ads accounts."""
+    """
+    Lists all accessible Google Ads accounts.
+    
+    This is typically the first command you should run to identify which accounts 
+    you have access to. The returned account IDs can be used in subsequent commands.
+    
+    Returns:
+        A formatted list of all Google Ads accounts accessible with your credentials
+    """
     try:
         creds = get_credentials()
         headers = get_headers(creds)
@@ -132,13 +147,26 @@ async def list_accounts() -> str:
         return f"Error listing accounts: {str(e)}"
 
 @mcp.tool()
-async def execute_gaql_query(customer_id: Any, query: str) -> str:
+async def execute_gaql_query(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax")
+) -> str:
     """
     Execute a custom GAQL (Google Ads Query Language) query.
     
+    This tool allows you to run any valid GAQL query against the Google Ads API.
+    Always specify the customer_id as a string (even if it looks like a number).
+    
     Args:
-        customer_id: The Google Ads customer ID (can be string or integer)
-        query: The GAQL query to execute
+        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
+        query: The GAQL query to execute (must follow GAQL syntax)
+        
+    Returns:
+        Formatted query results or error message
+        
+    Example:
+        customer_id: "1234567890"
+        query: "SELECT campaign.id, campaign.name FROM campaign LIMIT 10"
     """
     try:
         creds = get_credentials()
@@ -193,13 +221,32 @@ async def execute_gaql_query(customer_id: Any, query: str) -> str:
         return f"Error executing GAQL query: {str(e)}"
 
 @mcp.tool()
-async def get_campaign_performance(customer_id: Any, days: int = 30) -> str:
+async def get_campaign_performance(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)")
+) -> str:
     """
-    Get campaign performance metrics.
+    Get campaign performance metrics for the specified time period.
+    
+    RECOMMENDED WORKFLOW:
+    1. First run list_accounts() to get available account IDs
+    2. Then run get_account_currency() to see what currency the account uses
+    3. Finally run this command to get campaign performance
     
     Args:
-        customer_id: The Google Ads customer ID (can be string or integer)
+        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
         days: Number of days to look back (default: 30)
+        
+    Returns:
+        Formatted table of campaign performance data
+        
+    Note:
+        Cost values are in micros (millionths) of the account currency
+        (e.g., 1000000 = 1 USD in a USD account)
+        
+    Example:
+        customer_id: "1234567890"
+        days: 14
     """
     query = f"""
         SELECT
@@ -220,13 +267,32 @@ async def get_campaign_performance(customer_id: Any, days: int = 30) -> str:
     return await execute_gaql_query(customer_id, query)
 
 @mcp.tool()
-async def get_ad_performance(customer_id: Any, days: int = 30) -> str:
+async def get_ad_performance(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)")
+) -> str:
     """
-    Get ad performance metrics.
+    Get ad performance metrics for the specified time period.
+    
+    RECOMMENDED WORKFLOW:
+    1. First run list_accounts() to get available account IDs
+    2. Then run get_account_currency() to see what currency the account uses
+    3. Finally run this command to get ad performance
     
     Args:
-        customer_id: The Google Ads customer ID (can be string or integer)
+        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
         days: Number of days to look back (default: 30)
+        
+    Returns:
+        Formatted table of ad performance data
+        
+    Note:
+        Cost values are in micros (millionths) of the account currency
+        (e.g., 1000000 = 1 USD in a USD account)
+        
+    Example:
+        customer_id: "1234567890"
+        days: 14
     """
     query = f"""
         SELECT
@@ -248,30 +314,65 @@ async def get_ad_performance(customer_id: Any, days: int = 30) -> str:
     return await execute_gaql_query(customer_id, query)
 
 @mcp.tool()
-async def run_gaql(customer_id: Any, query: str, format: str = "table") -> str:
+async def run_gaql(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
+    format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'")
+) -> str:
     """
     Execute any arbitrary GAQL (Google Ads Query Language) query with custom formatting options.
     
+    This is the most powerful tool for custom Google Ads data queries. Always format your
+    customer_id as a string, even though it looks like a number.
+    
     Args:
-        customer_id: The Google Ads customer ID (can be string or integer)
+        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
         query: The GAQL query to execute (any valid GAQL query)
         format: Output format ("table", "json", or "csv")
     
-    Example queries:
+    Returns:
+        Query results in the requested format
+    
+    EXAMPLE QUERIES:
+    
     1. Basic campaign metrics:
-        SELECT campaign.name, metrics.clicks, metrics.impressions 
+        SELECT 
+          campaign.name, 
+          metrics.clicks, 
+          metrics.impressions,
+          metrics.cost_micros
         FROM campaign 
         WHERE segments.date DURING LAST_7DAYS
     
     2. Ad group performance:
-        SELECT ad_group.name, metrics.conversions, metrics.cost_micros 
+        SELECT 
+          ad_group.name, 
+          metrics.conversions, 
+          metrics.cost_micros,
+          campaign.name
         FROM ad_group 
         WHERE metrics.clicks > 100
     
     3. Keyword analysis:
-        SELECT keyword.text, metrics.average_position, metrics.ctr 
+        SELECT 
+          keyword.text, 
+          metrics.average_position, 
+          metrics.ctr
         FROM keyword_view 
         ORDER BY metrics.impressions DESC
+        
+    4. Get conversion data:
+        SELECT
+          campaign.name,
+          metrics.conversions,
+          metrics.conversions_value,
+          metrics.cost_micros
+        FROM campaign
+        WHERE segments.date DURING LAST_30DAYS
+        
+    Note:
+        Cost values are in micros (millionths) of the account currency
+        (e.g., 1000000 = 1 USD in a USD account)
     """
     try:
         creds = get_credentials()
@@ -371,12 +472,27 @@ async def run_gaql(customer_id: Any, query: str, format: str = "table") -> str:
         return f"Error executing GAQL query: {str(e)}"
 
 @mcp.tool()
-async def get_ad_creatives(customer_id: Any) -> str:
+async def get_ad_creatives(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)")
+) -> str:
     """
     Get ad creative details including headlines, descriptions, and URLs.
     
+    This tool retrieves the actual ad content (headlines, descriptions) 
+    for review and analysis. Great for creative audits.
+    
+    RECOMMENDED WORKFLOW:
+    1. First run list_accounts() to get available account IDs
+    2. Then run this command with the desired account ID
+    
     Args:
-        customer_id: The Google Ads customer ID (can be string or integer)
+        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
+        
+    Returns:
+        Formatted list of ad creative details
+        
+    Example:
+        customer_id: "1234567890"
     """
     query = """
         SELECT
@@ -454,15 +570,23 @@ async def get_ad_creatives(customer_id: Any) -> str:
         return f"Error retrieving ad creatives: {str(e)}"
 
 @mcp.tool()
-async def get_account_currency(customer_id: Any) -> str:
+async def get_account_currency(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)")
+) -> str:
     """
     Retrieve the default currency code used by the Google Ads account.
     
+    IMPORTANT: Run this first before analyzing cost data to understand which currency
+    the account uses. Cost values are always displayed in the account's currency.
+    
     Args:
-        customer_id: The Google Ads customer ID (can be string or integer)
+        customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
     
     Returns:
         The account's default currency code (e.g., 'USD', 'EUR', 'GBP')
+        
+    Example:
+        customer_id: "1234567890"
     """
     query = """
         SELECT
@@ -497,6 +621,158 @@ async def get_account_currency(customer_id: Any) -> str:
     
     except Exception as e:
         return f"Error retrieving account currency: {str(e)}"
+
+@mcp.resource("gaql://reference")
+def gaql_reference() -> str:
+    """Google Ads Query Language (GAQL) reference documentation."""
+    return """
+    # Google Ads Query Language (GAQL) Reference
+    
+    GAQL is similar to SQL but with specific syntax for Google Ads. Here's a quick reference:
+    
+    ## Basic Query Structure
+    ```
+    SELECT field1, field2, ... 
+    FROM resource_type
+    WHERE condition
+    ORDER BY field [ASC|DESC]
+    LIMIT n
+    ```
+    
+    ## Common Field Types
+    
+    ### Resource Fields
+    - campaign.id, campaign.name, campaign.status
+    - ad_group.id, ad_group.name, ad_group.status
+    - ad_group_ad.ad.id, ad_group_ad.ad.final_urls
+    - keyword.text, keyword.match_type
+    
+    ### Metric Fields
+    - metrics.impressions
+    - metrics.clicks
+    - metrics.cost_micros
+    - metrics.conversions
+    - metrics.ctr
+    - metrics.average_cpc
+    
+    ### Segment Fields
+    - segments.date
+    - segments.device
+    - segments.day_of_week
+    
+    ## Common WHERE Clauses
+    
+    ### Date Ranges
+    - WHERE segments.date DURING LAST_7DAYS
+    - WHERE segments.date DURING LAST_30DAYS
+    - WHERE segments.date BETWEEN '2023-01-01' AND '2023-01-31'
+    
+    ### Filtering
+    - WHERE campaign.status = 'ENABLED'
+    - WHERE metrics.clicks > 100
+    - WHERE campaign.name LIKE '%Brand%'
+    
+    ## Tips
+    - Always check account currency before analyzing cost data
+    - Cost values are in micros (millionths): 1000000 = 1 unit of currency
+    - Use LIMIT to avoid large result sets
+    """
+
+@mcp.prompt("google_ads_workflow")
+def google_ads_workflow() -> str:
+    """Provides guidance on the recommended workflow for using Google Ads tools."""
+    return """
+    I'll help you analyze your Google Ads account data. Here's the recommended workflow:
+    
+    1. First, let's list all the accounts you have access to:
+       - Run the `list_accounts()` tool to get available account IDs
+    
+    2. Before analyzing cost data, let's check which currency the account uses:
+       - Run `get_account_currency(customer_id="ACCOUNT_ID")` with your selected account
+    
+    3. Now we can explore the account data:
+       - For campaign performance: `get_campaign_performance(customer_id="ACCOUNT_ID", days=30)`
+       - For ad performance: `get_ad_performance(customer_id="ACCOUNT_ID", days=30)`
+       - For ad creative review: `get_ad_creatives(customer_id="ACCOUNT_ID")`
+    
+    4. For custom queries, use the GAQL query tool:
+       - `run_gaql(customer_id="ACCOUNT_ID", query="YOUR_QUERY", format="table")`
+    
+    5. Let me know if you have specific questions about:
+       - Campaign performance
+       - Ad performance
+       - Keywords
+       - Budgets
+       - Conversions
+    
+    Important: Always provide the customer_id as a string, even though it looks like a number.
+    For example: customer_id="1234567890" (not customer_id=1234567890)
+    """
+
+@mcp.prompt("gaql_help")
+def gaql_help() -> str:
+    """Provides assistance for writing GAQL queries."""
+    return """
+    I'll help you write a Google Ads Query Language (GAQL) query. Here are some examples to get you started:
+    
+    ## Get campaign performance last 30 days
+    ```
+    SELECT
+      campaign.id,
+      campaign.name,
+      campaign.status,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.cost_micros,
+      metrics.conversions
+    FROM campaign
+    WHERE segments.date DURING LAST_30DAYS
+    ORDER BY metrics.cost_micros DESC
+    ```
+    
+    ## Get keyword performance
+    ```
+    SELECT
+      keyword.text,
+      keyword.match_type,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.cost_micros,
+      metrics.conversions
+    FROM keyword_view
+    WHERE segments.date DURING LAST_30DAYS
+    ORDER BY metrics.clicks DESC
+    ```
+    
+    ## Get ads with poor performance
+    ```
+    SELECT
+      ad_group_ad.ad.id,
+      ad_group_ad.ad.name,
+      campaign.name,
+      ad_group.name,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.conversions
+    FROM ad_group_ad
+    WHERE 
+      segments.date DURING LAST_30DAYS
+      AND metrics.impressions > 1000
+      AND metrics.ctr < 0.01
+    ORDER BY metrics.impressions DESC
+    ```
+    
+    Once you've chosen a query, use it with:
+    ```
+    run_gaql(customer_id="YOUR_ACCOUNT_ID", query="YOUR_QUERY_HERE")
+    ```
+    
+    Remember:
+    - Always provide the customer_id as a string
+    - Cost values are in micros (1,000,000 = 1 unit of currency)
+    - Use LIMIT to avoid large result sets
+    - Check the account currency before analyzing cost data
+    """
 
 if __name__ == "__main__":
     # Start the MCP server on stdio transport
