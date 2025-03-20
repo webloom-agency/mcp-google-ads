@@ -1,6 +1,6 @@
 # Google Ads MCP
 
-<img src="bg.jpeg" alt="Google Ads MCP" />
+![Google Ads MCP](bg.jpeg)
 
 A tool that connects [Google Ads](https://ads.google.com/) with Claude AI, allowing you to analyze your advertising data through natural language conversations. This integration gives you access to campaign information, performance metrics, keyword analytics, and ad management—all through simple chat with Claude.
 
@@ -49,8 +49,9 @@ Here's what you can ask Claude to do once you've set up this integration:
 
 The `run_gaql` tool is especially powerful as it allows you to run any custom Google Ads Query Language (GAQL) query. Here are some example queries you can use:
 
-**Example 1: Basic campaign metrics**
-```
+### Example 1: Basic campaign metrics
+
+```sql
 SELECT 
     campaign.name, 
     metrics.clicks, 
@@ -59,8 +60,9 @@ FROM campaign
 WHERE segments.date DURING LAST_7DAYS
 ```
 
-**Example 2: Ad group performance**
-```
+### Example 2: Ad group performance
+
+```sql
 SELECT 
     ad_group.name, 
     metrics.conversions, 
@@ -69,8 +71,9 @@ FROM ad_group
 WHERE metrics.clicks > 100
 ```
 
-**Example 3: Keyword analysis**
-```
+### Example 3: Keyword analysis
+
+```sql
 SELECT 
     keyword.text, 
     metrics.average_position, 
@@ -90,6 +93,7 @@ ORDER BY metrics.impressions DESC
 Before using this tool, you'll need to create API credentials that allow Claude to access your Google Ads data. You can choose between two authentication methods:
 
 #### Option A: OAuth 2.0 Client ID (User Authentication)
+
 Best for individual users or desktop applications:
 
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/)
@@ -101,6 +105,7 @@ Best for individual users or desktop applications:
 7. Create a Google Ads API Developer token (see below)
 
 #### Option B: Service Account (Server-to-Server Authentication)
+
 Better for automated systems or managing multiple accounts:
 
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/)
@@ -112,17 +117,20 @@ Better for automated systems or managing multiple accounts:
 7. Create a Google Ads API Developer token (see below)
 
 Choose OAuth 2.0 Client ID if:
+
 - You're building a desktop application
 - Users need to explicitly grant access
 - You're managing a single account or a few personal accounts
 - You want users to have control over access permissions
 
 Choose Service Account if:
+
 - You're building an automated system
 - You need server-to-server authentication
 - You're managing multiple accounts programmatically
 - You don't want/need user interaction for authentication
-1. Sign in to your Google Ads account at https://ads.google.com
+
+1. Sign in to your Google Ads account at [https://ads.google.com](https://ads.google.com)
 2. Click on Tools & Settings (wrench icon) in the top navigation
 3. Under "Setup", click "API Center"
 4. If you haven't already, accept the Terms of Service
@@ -140,27 +148,24 @@ The `GOOGLE_ADS_LOGIN_CUSTOMER_ID` is optional and is primarily used when:
 - You need to access multiple client accounts under that manager account
 
 The Login Customer ID should be your Manager Account ID (format: XXX-XXX-XXXX) if:
+
 - You're accessing multiple accounts under a manager account
 - You want to use manager account credentials to access client accounts
 
 You can skip this setting if:
+
 - You're only accessing a single Google Ads account
 - You're using credentials directly from the account you want to access
 
 To find your Manager Account ID:
+
 1. Sign in to your Google Ads Manager Account
 2. Click on the settings icon (gear)
 3. Your Manager Account ID will be displayed in the format XXX-XXX-XXXX
-
-5. Download the credentials file (a JSON file)
+4. Download the credentials file (a JSON file)
 
 **🎬 Watch this beginner-friendly tutorial on Youtube:**
-
-<div align="center">
-  COMING SOON
-</div>
-
-*Click the image above to watch the step-by-step video tutorial*
+COMING SOON
 
 ### 2. Install Required Software
 
@@ -191,12 +196,14 @@ git clone https://github.com/ixigo/mcp-google-ads.git
 Open your computer's Terminal (Mac) or Command Prompt (Windows):
 
 1. Navigate to the folder where you unzipped the files:
+
    ```bash
    # Example (replace with your actual path):
    cd ~/Documents/mcp-google-ads-main
    ```
 
 2. Create a virtual environment (this keeps the project dependencies isolated):
+
    ```bash
    # Using uv (recommended):
    uv venv .venv
@@ -213,6 +220,7 @@ Open your computer's Terminal (Mac) or Command Prompt (Windows):
    **Note:** If you get a "pip not found" error when trying to install uv, see the "If you get 'pip not found' error" section below.
 
 3. Activate the virtual environment:
+
    ```bash
    # On Mac/Linux:
    source .venv/bin/activate
@@ -222,6 +230,7 @@ Open your computer's Terminal (Mac) or Command Prompt (Windows):
    ```
 
 4. Install the required dependencies:
+
    ```bash
    # Using uv:
    uv pip install -r requirements.txt
@@ -234,6 +243,7 @@ Open your computer's Terminal (Mac) or Command Prompt (Windows):
    ```
 
    **If you get "pip not found" error:**
+
    ```bash
    # First ensure pip is installed and updated:
    python3 -m ensurepip --upgrade
@@ -255,53 +265,56 @@ When you see `(.venv)` at the beginning of your command prompt, it means the vir
 3. Open your computer's Terminal (Mac) or Command Prompt (Windows) and type:
 
 ```bash
-   # For Mac users:
-   nano ~/Library/Application\ Support/Claude/claude_desktop_config.json
-   
-   # For Windows users:
-   notepad %APPDATA%\Claude\claude_desktop_config.json
-   ```
+# For Mac users:
+nano ~/Library/Application\ Support/Claude/claude_desktop_config.json
 
-4. Add the following text (this tells Claude how to connect to Google Ads):
+# For Windows users:
+notepad %APPDATA%\Claude\claude_desktop_config.json
+```
 
-   ```json
-   {
-     "mcpServers": {
-       "googleAdsServer": {
-         "command": "/FULL/PATH/TO/mcp-google-ads-main/.venv/bin/python",
-         "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
-         "env": {
-           "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
-           "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
-           "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
-         }
-       }
-     }
-   }
-   ```
+Add the following text (this tells Claude how to connect to Google Ads):
 
-   **Important:** Replace all paths and values with the actual information for your account:
-   
-   - The first path should point to the Python executable inside your virtual environment
-   - The second path should point to the `google_ads_server.py` file inside the folder you unzipped
-   - The third path should point to your Google service account credentials JSON file
-   - Add your Google Ads Developer Token 
-   - Add your Google Ads Manager Account ID (if applicable)
-   
-   Examples:
-   - Mac: 
-     - Python path: `/Users/ernesto/Documents/mcp-google-ads/.venv/bin/python`
-     - Script path: `/Users/ernesto/Documents/mcp-google-ads/google_ads_server.py`
-   - Windows: 
-     - Python path: `C:\\Users\\ernesto\\Documents\\mcp-google-ads\\.venv\\Scripts\\python.exe`
-     - Script path: `C:\\Users\\ernesto\\Documents\\mcp-google-ads\\google_ads_server.py`
+```json
+{
+  "mcpServers": {
+    "googleAdsServer": {
+      "command": "/FULL/PATH/TO/mcp-google-ads-main/.venv/bin/python",
+      "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
+      "env": {
+        "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
+        "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
+      }
+    }
+  }
+}
+```
 
-5. Save the file:
+**Important:** Replace all paths and values with the actual information for your account:
+
+- The first path should point to the Python executable inside your virtual environment
+- The second path should point to the `google_ads_server.py` file inside the folder you unzipped
+- The third path should point to your Google service account credentials JSON file
+- Add your Google Ads Developer Token 
+- Add your Google Ads Manager Account ID (if applicable)
+
+Examples:
+
+- Mac: 
+  - Python path: `/Users/ernesto/Documents/mcp-google-ads/.venv/bin/python`
+  - Script path: `/Users/ernesto/Documents/mcp-google-ads/google_ads_server.py`
+- Windows: 
+  - Python path: `C:\\Users\\ernesto\\Documents\\mcp-google-ads\\.venv\\Scripts\\python.exe`
+  - Script path: `C:\\Users\\ernesto\\Documents\\mcp-google-ads\\google_ads_server.py`
+
+4. Save the file:
+
    - Mac: Press Ctrl+O, then Enter, then Ctrl+X to exit
    - Windows: Click File > Save, then close Notepad
 
-6. Restart Claude Desktop
-7. When Claude opens, you should now see Google Ads tools available in the tools section
+5. Restart Claude Desktop
+
+6. When Claude opens, you should now see Google Ads tools available in the tools section
 
 ### 5a. Connect to Cursor (AI Code Editor)
 
@@ -422,6 +435,7 @@ If you encounter errors related to Python not being found, you can create an ali
    ```
 
 2. Verify the alias works:
+
    ```bash
    python --version
    ```
@@ -469,6 +483,7 @@ The repository includes a test file `test_google_ads_mcp.py` that lets you verif
 #### Setting Up the Test File
 
 1. Make sure your virtual environment is activated:
+
    ```bash
    # On Mac/Linux:
    source .venv/bin/activate
@@ -500,7 +515,7 @@ If all tests complete successfully, your setup is working correctly and ready to
 
 ## Contributing
 
-Found a bug or have an idea for improvement? We welcome your input! Open an issue or submit a pull request on GitHub, or contact Ernesto Cohnen directly at ernesto@ixigo.com.
+Found a bug or have an idea for improvement? We welcome your input! Open an issue or submit a pull request on GitHub, or contact Ernesto Cohnen directly at [ernesto@ixigo.com](mailto:ernesto@ixigo.com).
 
 ---
 

@@ -10,6 +10,34 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Import your MCP server module
 import google_ads_server
 
+def test_format_customer_id():
+    """Test the format_customer_id function with various input formats."""
+    test_cases = [
+        # Regular ID
+        ("9873186703", "9873186703"),
+        # ID with dashes
+        ("987-318-6703", "9873186703"),
+        # ID with quotes
+        ('"9873186703"', "9873186703"),
+        # ID with escaped quotes
+        ('\"9873186703\"', "9873186703"),
+        # ID with leading zeros
+        ("0009873186703", "9873186703"),
+        # Short ID that needs padding
+        ("12345", "0000012345"),
+        # ID with other non-digit characters
+        ("{9873186703}", "9873186703"),
+    ]
+    
+    print("\n=== Testing format_customer_id with various formats ===")
+    for input_id, expected in test_cases:
+        result = google_ads_server.format_customer_id(input_id)
+        print(f"Input: {input_id}")
+        print(f"Result: {result}")
+        print(f"Expected: {expected}")
+        print(f"Test {'PASSED' if result == expected else 'FAILED'}")
+        print("-" * 50)
+
 async def test_mcp_tools():
     """Test Google Ads MCP tools directly."""
     # Get a list of available customer IDs first
@@ -59,6 +87,9 @@ async def test_mcp_tools():
     print(gaql_result)
 
 if __name__ == "__main__":
+    # Run format_customer_id tests first
+    test_format_customer_id()
+    
     # Setup environment variables if they're not already set
     if not os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH"):
         # Set environment variables for testing (comment out if already set in your environment)
@@ -67,5 +98,5 @@ if __name__ == "__main__":
         os.environ["GOOGLE_ADS_CLIENT_ID"] = "YOUR_CLIENT_ID"  # Replace with placeholder
         os.environ["GOOGLE_ADS_CLIENT_SECRET"] = "YOUR_CLIENT_SECRET"  # Replace with placeholder
     
-    # Run the test
-    asyncio.run(test_mcp_tools())
+    # Run the MCP tools test (uncomment to run full tests)
+    # asyncio.run(test_mcp_tools())

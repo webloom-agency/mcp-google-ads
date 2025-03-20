@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional
+from pydantic import Field
 import os
 import json
 import requests
@@ -34,7 +35,10 @@ def format_customer_id(customer_id: str) -> str:
     # Convert to string if passed as integer or another type
     customer_id = str(customer_id)
     
-    # Remove any non-digit characters (including quotes, braces, etc.)
+    # Remove any quotes surrounding the customer_id (both escaped and unescaped)
+    customer_id = customer_id.replace('\"', '').replace('"', '')
+    
+    # Remove any non-digit characters (including dashes, braces, etc.)
     customer_id = ''.join(char for char in customer_id if char.isdigit())
     
     # Ensure it's 10 digits with leading zeros if needed
