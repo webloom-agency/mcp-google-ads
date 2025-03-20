@@ -87,20 +87,77 @@ ORDER BY metrics.impressions DESC
 
 ### 1. Set Up Google Ads API Access
 
-Before using this tool, you'll need to create API credentials that allow Claude to access your Google Ads data:
+Before using this tool, you'll need to create API credentials that allow Claude to access your Google Ads data. You can choose between two authentication methods:
 
-1. Create a Google Cloud account if you don't have one and access the [Google Cloud Console](https://console.cloud.google.com/)
-2. Set up a service account (like a special user for API access)
-3. Download the credentials file (a JSON file)
-4. Grant this service account access to your Google Ads accounts
-5. Create a Google Ads API Developer token through your Google Ads account
+#### Option A: OAuth 2.0 Client ID (User Authentication)
+Best for individual users or desktop applications:
+
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a new project or select an existing one
+3. Enable the Google Ads API
+4. Go to "Credentials" → "Create Credentials" → "OAuth Client ID"
+5. Choose "Desktop Application" as the application type
+6. Download the OAuth client configuration file (client_secret.json)
+7. Create a Google Ads API Developer token (see below)
+
+#### Option B: Service Account (Server-to-Server Authentication)
+Better for automated systems or managing multiple accounts:
+
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a new project or select an existing one
+3. Enable the Google Ads API
+4. Go to "Credentials" → "Create Credentials" → "Service Account"
+5. Download the service account key file (JSON)
+6. Grant the service account access to your Google Ads accounts
+7. Create a Google Ads API Developer token (see below)
+
+Choose OAuth 2.0 Client ID if:
+- You're building a desktop application
+- Users need to explicitly grant access
+- You're managing a single account or a few personal accounts
+- You want users to have control over access permissions
+
+Choose Service Account if:
+- You're building an automated system
+- You need server-to-server authentication
+- You're managing multiple accounts programmatically
+- You don't want/need user interaction for authentication
+1. Sign in to your Google Ads account at https://ads.google.com
+2. Click on Tools & Settings (wrench icon) in the top navigation
+3. Under "Setup", click "API Center"
+4. If you haven't already, accept the Terms of Service
+5. Click "Apply for token" 
+6. Fill out the application form with details about how you plan to use the API
+7. Submit the application and wait for approval (usually 1-3 business days)
+
+Note: Initially, you'll get a test Developer Token that has some limitations. Once you've tested your implementation, you can apply for a production token that removes these restrictions.
+
+### Understanding the Login Customer ID
+
+The `GOOGLE_ADS_LOGIN_CUSTOMER_ID` is optional and is primarily used when:
+
+- You're working with a Google Ads Manager Account (MCC)
+- You need to access multiple client accounts under that manager account
+
+The Login Customer ID should be your Manager Account ID (format: XXX-XXX-XXXX) if:
+- You're accessing multiple accounts under a manager account
+- You want to use manager account credentials to access client accounts
+
+You can skip this setting if:
+- You're only accessing a single Google Ads account
+- You're using credentials directly from the account you want to access
+
+To find your Manager Account ID:
+1. Sign in to your Google Ads Manager Account
+2. Click on the settings icon (gear)
+3. Your Manager Account ID will be displayed in the format XXX-XXX-XXXX
+
+5. Download the credentials file (a JSON file)
 
 **🎬 Watch this beginner-friendly tutorial on Youtube:**
 
 <div align="center">
-  <a href="https://youtu.be/example-video-id">
-    <img src="https://example.com/thumbnail.jpg" alt="Google Ads API Setup Tutorial" width="600" style="margin: 20px 0; border-radius: 8px;">
-  </a>
+  COMING SOON
 </div>
 
 *Click the image above to watch the step-by-step video tutorial*
@@ -211,10 +268,10 @@ When you see `(.venv)` at the beginning of your command prompt, it means the vir
    {
      "mcpServers": {
        "googleAdsServer": {
-         "command": "/FULL/PATH/TO/-main/.venv/bin/python",
+         "command": "/FULL/PATH/TO/mcp-google-ads-main/.venv/bin/python",
          "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
          "env": {
-           "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/service_account_credentials.json",
+           "GOOGLE_ADS_CREDENTIALS_PATH": /FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
            "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
            "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
          }
@@ -267,10 +324,10 @@ Cursor is an AI-powered code editor that can be enhanced with MCP tools. You can
    {
      "mcpServers": {
        "googleAdsServer": {
-         "command": "/FULL/PATH/TO/-main/.venv/bin/python",
+         "command": "/FULL/PATH/TO/mcp-google-ads-main/.venv/bin/python",
          "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
          "env": {
-           "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/service_account_credentials.json",
+           "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
            "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
            "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
          }
