@@ -470,7 +470,7 @@ alwaysApply: false
   4 | 
   5 | You can now find FastMCP as part of the official Model Context Protocol Python SDK:
   6 | 
-  7 | 👉 [github.com/modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk)
+  7 | 👉 [github.com/modelcontextprotocol/python-sdk](mdc:https:/github.com/modelcontextprotocol/python-sdk)
   8 | 
   9 | *Please note: this repository is no longer maintained.*
  10 | 
@@ -487,14 +487,14 @@ alwaysApply: false
  21 | # FastMCP 🚀
  22 | <strong>The fast, Pythonic way to build MCP servers.</strong>
  23 | 
- 24 | [![PyPI - Version](https://img.shields.io/pypi/v/fastmcp.svg)](https://pypi.org/project/fastmcp)
- 25 | [![Tests](https://github.com/jlowin/fastmcp/actions/workflows/run-tests.yml/badge.svg)](https://github.com/jlowin/fastmcp/actions/workflows/run-tests.yml)
- 26 | [![License](https://img.shields.io/github/license/jlowin/fastmcp.svg)](https://github.com/jlowin/fastmcp/blob/main/LICENSE)
+ 24 | [![PyPI - Version](mdc:https:/img.shields.io/pypi/v/fastmcp.svg)](https://pypi.org/project/fastmcp)
+ 25 | [![Tests](mdc:https:/github.com/jlowin/fastmcp/actions/workflows/run-tests.yml/badge.svg)](https://github.com/jlowin/fastmcp/actions/workflows/run-tests.yml)
+ 26 | [![License](mdc:https:/img.shields.io/github/license/jlowin/fastmcp.svg)](https://github.com/jlowin/fastmcp/blob/main/LICENSE)
  27 | 
  28 | 
  29 | </div>
  30 | 
- 31 | [Model Context Protocol (MCP)](https://modelcontextprotocol.io) servers are a new, standardized way to provide context and tools to your LLMs, and FastMCP makes building MCP servers simple and intuitive. Create tools, expose resources, and define prompts with clean, Pythonic code:
+ 31 | [Model Context Protocol (MCP)](mdc:https:/modelcontextprotocol.io) servers are a new, standardized way to provide context and tools to your LLMs, and FastMCP makes building MCP servers simple and intuitive. Create tools, expose resources, and define prompts with clean, Pythonic code:
  32 | 
  33 | ```python
  34 | # demo.py
@@ -534,34 +534,34 @@ alwaysApply: false
  68 | <!-- omit in toc -->
  69 | ## Table of Contents
  70 | 
- 71 | - [Installation](#installation)
- 72 | - [Quickstart](#quickstart)
- 73 | - [What is MCP?](#what-is-mcp)
- 74 | - [Core Concepts](#core-concepts)
- 75 |   - [Server](#server)
- 76 |   - [Resources](#resources)
- 77 |   - [Tools](#tools)
- 78 |   - [Prompts](#prompts)
- 79 |   - [Images](#images)
- 80 |   - [Context](#context)
- 81 | - [Running Your Server](#running-your-server)
- 82 |   - [Development Mode (Recommended for Building \& Testing)](#development-mode-recommended-for-building--testing)
- 83 |   - [Claude Desktop Integration (For Regular Use)](#claude-desktop-integration-for-regular-use)
- 84 |   - [Direct Execution (For Advanced Use Cases)](#direct-execution-for-advanced-use-cases)
- 85 |   - [Server Object Names](#server-object-names)
- 86 | - [Examples](#examples)
- 87 |   - [Echo Server](#echo-server)
- 88 |   - [SQLite Explorer](#sqlite-explorer)
- 89 | - [Contributing](#contributing)
- 90 |   - [Prerequisites](#prerequisites)
- 91 |   - [Installation](#installation-1)
- 92 |   - [Testing](#testing)
- 93 |   - [Formatting](#formatting)
- 94 |   - [Opening a Pull Request](#opening-a-pull-request)
+ 71 | - [Installation](mdc:#installation)
+ 72 | - [Quickstart](mdc:#quickstart)
+ 73 | - [What is MCP?](mdc:#what-is-mcp)
+ 74 | - [Core Concepts](mdc:#core-concepts)
+ 75 |   - [Server](mdc:#server)
+ 76 |   - [Resources](mdc:#resources)
+ 77 |   - [Tools](mdc:#tools)
+ 78 |   - [Prompts](mdc:#prompts)
+ 79 |   - [Images](mdc:#images)
+ 80 |   - [Context](mdc:#context)
+ 81 | - [Running Your Server](mdc:#running-your-server)
+ 82 |   - [Development Mode (Recommended for Building \& Testing)](mdc:#development-mode-recommended-for-building--testing)
+ 83 |   - [Claude Desktop Integration (For Regular Use)](mdc:#claude-desktop-integration-for-regular-use)
+ 84 |   - [Direct Execution (For Advanced Use Cases)](mdc:#direct-execution-for-advanced-use-cases)
+ 85 |   - [Server Object Names](mdc:#server-object-names)
+ 86 | - [Examples](mdc:#examples)
+ 87 |   - [Echo Server](mdc:#echo-server)
+ 88 |   - [SQLite Explorer](mdc:#sqlite-explorer)
+ 89 | - [Contributing](mdc:#contributing)
+ 90 |   - [Prerequisites](mdc:#prerequisites)
+ 91 |   - [Installation](mdc:#installation-1)
+ 92 |   - [Testing](mdc:#testing)
+ 93 |   - [Formatting](mdc:#formatting)
+ 94 |   - [Opening a Pull Request](mdc:#opening-a-pull-request)
  95 | 
  96 | ## Installation
  97 | 
- 98 | We strongly recommend installing FastMCP with [uv](https://docs.astral.sh/uv/), as it is required for deploying servers:
+ 98 | We strongly recommend installing FastMCP with [uv](mdc:https:/docs.astral.sh/uv), as it is required for deploying servers:
  99 | 
 100 | ```bash
 101 | uv pip install fastmcp
@@ -603,7 +603,7 @@ alwaysApply: false
 137 |     return f"Hello, {name}!"
 138 | ```
 139 | 
-140 | You can install this server in [Claude Desktop](https://claude.ai/download) and interact with it right away by running:
+140 | You can install this server in [Claude Desktop](mdc:https:/claude.ai/download) and interact with it right away by running:
 141 | ```bash
 142 | fastmcp install server.py
 143 | ```
@@ -613,18 +613,18 @@ alwaysApply: false
 147 | fastmcp dev server.py
 148 | ```
 149 | 
-150 | ![MCP Inspector](/docs/assets/demo-inspector.png)
+150 | ![MCP Inspector](mdc:docs/assets/demo-inspector.png)
 151 | 
 152 | ## What is MCP?
 153 | 
-154 | The [Model Context Protocol (MCP)](https://modelcontextprotocol.io) lets you build servers that expose data and functionality to LLM applications in a secure, standardized way. Think of it like a web API, but specifically designed for LLM interactions. MCP servers can:
+154 | The [Model Context Protocol (MCP)](mdc:https:/modelcontextprotocol.io) lets you build servers that expose data and functionality to LLM applications in a secure, standardized way. Think of it like a web API, but specifically designed for LLM interactions. MCP servers can:
 155 | 
 156 | - Expose data through **Resources** (think of these sort of like GET endpoints; they are used to load information into the LLM's context)
 157 | - Provide functionality through **Tools** (sort of like POST endpoints; they are used to execute code or otherwise produce a side effect)
 158 | - Define interaction patterns through **Prompts** (reusable templates for LLM interactions)
 159 | - And more!
 160 | 
-161 | There is a low-level [Python SDK](https://github.com/modelcontextprotocol/python-sdk) available for implementing the protocol directly, but FastMCP aims to make that easier by providing a high-level, Pythonic interface.
+161 | There is a low-level [Python SDK](mdc:https:/github.com/modelcontextprotocol/python-sdk) available for implementing the protocol directly, but FastMCP aims to make that easier by providing a high-level, Pythonic interface.
 162 | 
 163 | ## Core Concepts
 164 | 
@@ -963,7 +963,7 @@ alwaysApply: false
 497 | 
 498 | ### Prerequisites
 499 | 
-500 | FastMCP requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+500 | FastMCP requires Python 3.10+ and [uv](mdc:https:/docs.astral.sh/uv).
 501 | 
 502 | ### Installation
 503 | 
