@@ -33,6 +33,9 @@ A tool that connects [Google Ads](https://ads.google.com/) with Claude AI, allow
 
 ---
 
+## Google Ads MCP Architecture Flow
+
+```mermaid
 flowchart TB
     User(User) -->|Interacts with| Claude
     Claude(Claude AI Assistant) -->|Makes requests to| MCP[Google Ads MCP Server]
@@ -87,6 +90,7 @@ flowchart TB
         ConfigFiles -->|Configures| Claude
         ConfigFiles -->|Configures| Cursor
     end
+```
 
 ## Available Tools
 
