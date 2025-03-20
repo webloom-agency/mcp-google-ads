@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import Field
 import os
 import json
@@ -152,7 +152,7 @@ async def list_accounts() -> str:
 
 @mcp.tool()
 async def execute_gaql_query(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    customer_id: Union[str, int] = Field(description="Google Ads customer ID (10 digits, no dashes)"),
     query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax")
 ) -> str:
     """
@@ -226,7 +226,7 @@ async def execute_gaql_query(
 
 @mcp.tool()
 async def get_campaign_performance(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string"),
     days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)")
 ) -> str:
     """
@@ -272,7 +272,7 @@ async def get_campaign_performance(
 
 @mcp.tool()
 async def get_ad_performance(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string"),
     days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)")
 ) -> str:
     """
@@ -477,7 +477,7 @@ async def run_gaql(
 
 @mcp.tool()
 async def get_ad_creatives(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)")
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string")
 ) -> str:
     """
     Get ad creative details including headlines, descriptions, and URLs.
