@@ -33,6 +33,61 @@ A tool that connects [Google Ads](https://ads.google.com/) with Claude AI, allow
 
 ---
 
+flowchart TB
+    User(User) -->|Interacts with| Claude
+    Claude(Claude AI Assistant) -->|Makes requests to| MCP[Google Ads MCP Server]
+    User -->|Can also use| Cursor[Cursor AI Code Editor]
+    Cursor -->|Makes requests to| MCP
+    
+    subgraph "MCP Server"
+        FastMCP[FastMCP Server] 
+        Tools[Available Tools]
+        Auth[Authentication]
+        
+        FastMCP -->|Exposes| Tools
+        FastMCP -->|Uses| Auth
+    end
+    
+    subgraph "Google Ads Tools"
+        ListAccounts[list_accounts]
+        ExecuteGAQL[execute_gaql_query]
+        CampaignPerf[get_campaign_performance]
+        AdPerf[get_ad_performance]
+        RunGAQL[run_gaql]
+    end
+    
+    Tools -->|Includes| ListAccounts
+    Tools -->|Includes| ExecuteGAQL
+    Tools -->|Includes| CampaignPerf
+    Tools -->|Includes| AdPerf
+    Tools -->|Includes| RunGAQL
+    
+    subgraph "Authentication"
+        OAuth[OAuth 2.0 Client ID]
+        ServiceAccount[Service Account]
+        Credentials[Google Ads API Credentials]
+        
+        OAuth -->|Provides| Credentials
+        ServiceAccount -->|Provides| Credentials
+    end
+    
+    MCP -->|Communicates with| GoogleAdsAPI[Google Ads API]
+    GoogleAdsAPI -->|Returns| AdData[Advertising Data]
+    AdData -->|Analyzed by| Claude
+    AdData -->|Visualized by| Claude
+    AdData -->|Can be used by| Cursor
+    
+    Credentials -->|Authorizes| GoogleAdsAPI
+    
+    subgraph "Configuration"
+        EnvVars[Environment Variables]
+        ConfigFiles[Configuration Files]
+        
+        EnvVars -->|Configures| MCP
+        ConfigFiles -->|Configures| Claude
+        ConfigFiles -->|Configures| Cursor
+    end
+
 ## Available Tools
 
 Here's what you can ask Claude to do once you've set up this integration:
