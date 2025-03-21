@@ -86,9 +86,62 @@ async def test_mcp_tools():
     gaql_result = await google_ads_server.run_gaql(customer_id, query, format="json")
     print(gaql_result)
 
+async def test_asset_methods():
+    """Test Asset-related MCP tools directly."""
+    # Get a list of available customer IDs first
+    print("=== Testing Asset Methods ===")
+    accounts_result = await google_ads_server.list_accounts()
+    
+    # Parse the accounts to extract a customer ID for further tests
+    customer_id = None
+    for line in accounts_result.split('\n'):
+        if line.startswith("Account ID:"):
+            customer_id = line.replace("Account ID:", "").strip()
+            break
+    
+    if not customer_id:
+        print("No customer IDs found. Cannot continue testing.")
+        return
+    
+    print(f"\nUsing customer ID: {customer_id} for testing asset methods\n")
+    
+    # Test get_image_assets
+    print("\n=== Testing get_image_assets ===")
+    image_assets_result = await google_ads_server.get_image_assets(customer_id, limit=10)
+    print(image_assets_result)
+    
+    # Extract an asset ID for further testing if available
+    asset_id = None
+    for line in image_assets_result.split('\n'):
+        if line.startswith("1. Asset ID:"):
+            asset_id = line.replace("1. Asset ID:", "").strip()
+            break
+    
+    # Use a smaller number of days for testing to avoid the INVALID_VALUE_WITH_DURING_OPERATOR error
+    days_to_test = 30  # Use 30 instead of 90
+    
+    # Test get_asset_usage if we found an asset ID
+    if asset_id:
+        print(f"\n=== Testing get_asset_usage with asset ID: {asset_id} ===")
+        try:
+            asset_usage_result = await google_ads_server.get_asset_usage(customer_id, asset_id=asset_id, asset_type="IMAGE")
+            print(asset_usage_result)
+        except Exception as e:
+            print(f"Error in get_asset_usage: {str(e)}")
+    else:
+        print("\nNo asset ID found to test get_asset_usage")
+    
+    # Test analyze_image_assets with a valid date range
+    print(f"\n=== Testing analyze_image_assets with {days_to_test} days ===")
+    try:
+        analyze_result = await google_ads_server.analyze_image_assets(customer_id, days=days_to_test)
+        print(analyze_result)
+    except Exception as e:
+        print(f"Error in analyze_image_assets: {str(e)}")
+
 if __name__ == "__main__":
     # Run format_customer_id tests first
-    test_format_customer_id()
+    # test_format_customer_id()
     
     # Setup environment variables if they're not already set
     if not os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH"):
@@ -100,3 +153,6 @@ if __name__ == "__main__":
     
     # Run the MCP tools test (uncomment to run full tests)
     # asyncio.run(test_mcp_tools())
+    
+    # Run the asset methods test (uncomment to run full tests)
+    asyncio.run(test_asset_methods())

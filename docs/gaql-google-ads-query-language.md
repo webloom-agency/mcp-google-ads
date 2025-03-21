@@ -267,6 +267,104 @@ SELECT
 WHERE name LIKE 'campaign.%'
 ```
 
+I'll help add information about assets to the GAQL guidelines document. Here's how I would incorporate the new information:
+
+```markdown:gaql-google-ads-query-language.mdc
+// ... existing code ...
+
+## Asset Queries
+
+### Asset Entity Queries
+
+You can get a list of assets and their attributes by querying the `asset` entity:
+
+```
+SELECT
+  asset.id,
+  asset.name,
+  asset.resource_name,
+  asset.type
+FROM asset
+```
+
+### Type-Specific Asset Attributes
+
+Assets have type-specific attributes that can be queried based on their type:
+
+```
+SELECT
+  asset.id,
+  asset.name,
+  asset.resource_name,
+  asset.youtube_video_asset.youtube_video_id
+FROM asset
+WHERE asset.type = 'YOUTUBE_VIDEO'
+```
+
+### Asset Metrics at Different Levels
+
+Asset metrics are available through three main resources:
+
+1. **ad_group_asset**: Asset metrics at the ad group level
+2. **campaign_asset**: Asset metrics at the campaign level
+3. **customer_asset**: Asset metrics at the customer level
+
+Example of querying ad-group level asset metrics:
+
+```
+SELECT
+  ad_group.id,
+  asset.id,
+  metrics.clicks,
+  metrics.impressions
+FROM ad_group_asset
+WHERE segments.date DURING LAST_MONTH
+ORDER BY metrics.impressions DESC
+```
+
+### Ad-Level Asset Performance
+
+Ad-level performance metrics for assets are aggregated in the `ad_group_ad_asset_view`. 
+
+**Note**: The `ad_group_ad_asset_view` only returns information for assets related to App ads.
+
+This view includes the `performance_label` attribute with the following possible values:
+- `BEST`: Best performing assets
+- `GOOD`: Good performing assets
+- `LOW`: Worst performing assets
+- `LEARNING`: Asset has impressions but stats aren't statistically significant yet
+- `PENDING`: Asset doesn't have performance information yet (may be under review)
+- `UNKNOWN`: Value unknown in this version
+- `UNSPECIFIED`: Not specified
+
+Example query for ad-level asset performance:
+
+```
+SELECT
+  ad_group_ad_asset_view.ad_group_ad,
+  ad_group_ad_asset_view.asset,
+  ad_group_ad_asset_view.field_type,
+  ad_group_ad_asset_view.performance_label,
+  metrics.impressions,
+  metrics.clicks,
+  metrics.cost_micros,
+  metrics.conversions
+FROM ad_group_ad_asset_view
+WHERE segments.date DURING LAST_MONTH
+ORDER BY ad_group_ad_asset_view.performance_label
+```
+
+### Asset Source Information
+
+- `Asset.source` is only accurate for mutable Assets
+- For the source of RSA (Responsive Search Ad) Assets, use `AdGroupAdAsset.source`
+
+// ... existing code ...
+```
+
+This addition provides comprehensive information about querying assets in GAQL, including different asset types, how to access metrics at various levels, performance labeling, and important notes about asset source information.
+
+
 ## Best Practices
 
 1. **Field Selection**: Only select the fields you need to reduce response size and improve performance.
