@@ -175,6 +175,15 @@ Better for automated systems or managing multiple accounts:
 6. Grant the service account access to your Google Ads accounts
 7. Create a Google Ads API Developer token (see below)
 
+#### Authentication Token Refreshing
+
+The application now includes robust token refresh handling:
+
+- **OAuth 2.0 Tokens**: The tool will automatically refresh expired OAuth tokens when possible, or prompt for re-authentication if the refresh token is invalid.
+- **Service Account Tokens**: Service account tokens are automatically generated and refreshed as needed without user intervention.
+
+#### Authentication Method Comparison
+
 Choose OAuth 2.0 Client ID if:
 
 - You're building a desktop application
@@ -188,6 +197,9 @@ Choose Service Account if:
 - You need server-to-server authentication
 - You're managing multiple accounts programmatically
 - You don't want/need user interaction for authentication
+- You need automatic token refreshing without user intervention
+
+#### Getting a Developer Token
 
 1. Sign in to your Google Ads account at [https://ads.google.com](https://ads.google.com)
 2. Click on Tools & Settings (wrench icon) in the top navigation
@@ -317,7 +329,92 @@ Open your computer's Terminal (Mac) or Command Prompt (Windows):
 
 When you see `(.venv)` at the beginning of your command prompt, it means the virtual environment is active and the dependencies will be installed there without affecting your system Python installation.
 
-### 5. Connect Claude to Google Ads
+### 5. Setting Up Environment Configuration
+
+The Google Ads MCP now supports environment file configuration for easier setup.
+
+#### Using .env File (Recommended)
+
+1. Copy the `.env.example` file to `.env` in your project directory:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit the `.env` file with your actual configuration values:
+
+   ```bash
+   # Edit the .env file with your favorite text editor
+   # For Mac:
+   nano .env
+   
+   # For Windows:
+   notepad .env
+   ```
+
+3. Set the following values in your `.env` file:
+
+   ```
+   # Authentication Type: "oauth" or "service_account"
+   GOOGLE_ADS_AUTH_TYPE=oauth
+   
+   # Path to your credentials file (OAuth client secret or service account key)
+   GOOGLE_ADS_CREDENTIALS_PATH=/path/to/your/credentials.json
+   
+   # Your Google Ads Developer Token
+   GOOGLE_ADS_DEVELOPER_TOKEN=your_developer_token_here
+   
+   # Optional: Manager Account ID (if applicable)
+   GOOGLE_ADS_LOGIN_CUSTOMER_ID=your_manager_account_id
+   ```
+
+4. Save the file.
+
+The application will automatically load these values from the `.env` file when it starts.
+
+#### Using Direct Environment Variables
+
+You can also set environment variables directly in your system or in the configuration files for Claude or Cursor:
+
+##### For Claude Desktop
+
+```json
+{
+  "mcpServers": {
+    "googleAdsServer": {
+      "command": "/FULL/PATH/TO/mcp-google-ads-main/.venv/bin/python",
+      "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
+      "env": {
+        "GOOGLE_ADS_AUTH_TYPE": "oauth",
+        "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/credentials.json",
+        "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
+      }
+    }
+  }
+}
+```
+
+##### For Cursor
+
+```json
+{
+  "mcpServers": {
+    "googleAdsServer": {
+      "command": "/FULL/PATH/TO/mcp-google-ads-main/.venv/bin/python",
+      "args": ["/FULL/PATH/TO/mcp-google-ads-main/google_ads_server.py"],
+      "env": {
+        "GOOGLE_ADS_AUTH_TYPE": "oauth",
+        "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/credentials.json",
+        "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
+      }
+    }
+  }
+}
+```
+
+### 6. Connect Claude to Google Ads
 
 1. Download and install [Claude Desktop](https://claude.ai/download) if you haven't already
 2. Make sure you have your Google service account credentials file saved somewhere on your computer
@@ -537,9 +634,9 @@ Remember that most issues have been encountered by others before, and there's us
 
 ### Testing Your Setup
 
-The repository includes a test file `test_google_ads_mcp.py` that lets you verify your Google Ads API connection is working correctly before using it with Claude or Cursor.
+The repository includes test files that let you verify your Google Ads API connection is working correctly before using it with Claude or Cursor.
 
-#### Setting Up the Test File
+#### Testing Basic Functionality
 
 1. Make sure your virtual environment is activated:
 
@@ -567,6 +664,25 @@ The repository includes a test file `test_google_ads_mcp.py` that lets you verif
    - Test ad performance data
    - Retrieve ad creatives
    - Run a sample GAQL query
+
+#### Testing Authentication and Token Refresh
+
+To specifically test the authentication and token refresh mechanisms:
+
+1. Make sure your virtual environment is activated and your `.env` file is configured.
+
+2. Run the token refresh test:
+   ```bash
+   python test_token_refresh.py
+   ```
+
+3. This test will:
+   - Verify that credentials can be loaded from your configured auth type (OAuth or service account)
+   - Display information about the current token status and expiry
+   - Test the customer ID formatting function
+   - For OAuth tokens, attempt to refresh the token and verify it worked
+
+The token refresh test can help confirm that both OAuth and service account credentials are properly configured before using the server with Claude or Cursor.
    
 If all tests complete successfully, your setup is working correctly and ready to use with Claude or Cursor.
 
