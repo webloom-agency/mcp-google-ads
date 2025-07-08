@@ -212,7 +212,22 @@ def get_headers(creds):
         creds.refresh(auth_req)
         token = creds.token
     else:
-        # For OAuth credentials
+        # For OAuth credentials, check if token needs refresh
+        if not creds.valid:
+            if creds.expired and creds.refresh_token:
+                try:
+                    logger.info("Refreshing expired OAuth token in get_headers")
+                    creds.refresh(Request())
+                    logger.info("Token successfully refreshed in get_headers")
+                except RefreshError as e:
+                    logger.error(f"Error refreshing token in get_headers: {str(e)}")
+                    raise ValueError(f"Failed to refresh OAuth token: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Unexpected error refreshing token in get_headers: {str(e)}")
+                    raise
+            else:
+                raise ValueError("OAuth credentials are invalid and cannot be refreshed")
+        
         token = creds.token
         
     headers = {
@@ -267,14 +282,13 @@ async def list_accounts() -> str:
 
 @mcp.tool()
 async def execute_gaql_query(
-    customer_id: Union[str, int] = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax")
 ) -> str:
     """
     Execute a custom GAQL (Google Ads Query Language) query.
     
     This tool allows you to run any valid GAQL query against the Google Ads API.
-    Always specify the customer_id as a string (even if it looks like a number).
     
     Args:
         customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
@@ -341,7 +355,7 @@ async def execute_gaql_query(
 
 @mcp.tool()
 async def get_campaign_performance(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)")
 ) -> str:
     """
@@ -378,7 +392,7 @@ async def get_campaign_performance(
             metrics.conversions,
             metrics.average_cpc
         FROM campaign
-        WHERE segments.date DURING LAST_{days}DAYS
+        WHERE segments.date DURING LAST_{days}_DAYS
         ORDER BY metrics.cost_micros DESC
         LIMIT 50
     """
@@ -387,7 +401,7 @@ async def get_campaign_performance(
 
 @mcp.tool()
 async def get_ad_performance(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)")
 ) -> str:
     """
@@ -425,7 +439,7 @@ async def get_ad_performance(
             metrics.cost_micros,
             metrics.conversions
         FROM ad_group_ad
-        WHERE segments.date DURING LAST_{days}DAYS
+        WHERE segments.date DURING LAST_{days}_DAYS
         ORDER BY metrics.impressions DESC
         LIMIT 50
     """
@@ -434,15 +448,14 @@ async def get_ad_performance(
 
 @mcp.tool()
 async def run_gaql(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
     format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'")
 ) -> str:
     """
     Execute any arbitrary GAQL (Google Ads Query Language) query with custom formatting options.
     
-    This is the most powerful tool for custom Google Ads data queries. Always format your
-    customer_id as a string, even though it looks like a number.
+    This is the most powerful tool for custom Google Ads data queries.
     
     Args:
         customer_id: The Google Ads customer ID as a string (10 digits, no dashes)
@@ -461,7 +474,7 @@ async def run_gaql(
           metrics.impressions,
           metrics.cost_micros
         FROM campaign 
-        WHERE segments.date DURING LAST_7DAYS
+        WHERE segments.date DURING LAST_7_DAYS
     
     2. Ad group performance:
         SELECT 
@@ -487,9 +500,9 @@ async def run_gaql(
           metrics.conversions_value,
           metrics.cost_micros
         FROM campaign
-        WHERE segments.date DURING LAST_30DAYS
+        WHERE segments.date DURING LAST_30_DAYS
         
-    Note:
+            Note:
         Cost values are in micros (millionths) of the account currency
         (e.g., 1000000 = 1 USD in a USD account)
     """
@@ -592,7 +605,7 @@ async def run_gaql(
 
 @mcp.tool()
 async def get_ad_creatives(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string")
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'")
 ) -> str:
     """
     Get ad creative details including headlines, descriptions, and URLs.
@@ -690,7 +703,7 @@ async def get_ad_creatives(
 
 @mcp.tool()
 async def get_account_currency(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes)")
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'")
 ) -> str:
     """
     Retrieve the default currency code used by the Google Ads account.
@@ -717,6 +730,16 @@ async def get_account_currency(
     
     try:
         creds = get_credentials()
+        
+        # Force refresh if needed
+        if not creds.valid:
+            logger.info("Credentials not valid, attempting refresh...")
+            if hasattr(creds, 'refresh_token') and creds.refresh_token:
+                creds.refresh(Request())
+                logger.info("Credentials refreshed successfully")
+            else:
+                raise ValueError("Invalid credentials and no refresh token available")
+        
         headers = get_headers(creds)
         
         formatted_customer_id = format_customer_id(customer_id)
@@ -739,6 +762,7 @@ async def get_account_currency(
         return f"Account {formatted_customer_id} uses currency: {currency_code}"
     
     except Exception as e:
+        logger.error(f"Error retrieving account currency: {str(e)}")
         return f"Error retrieving account currency: {str(e)}"
 
 @mcp.resource("gaql://reference")
@@ -782,8 +806,8 @@ def gaql_reference() -> str:
     ## Common WHERE Clauses
     
     ### Date Ranges
-    - WHERE segments.date DURING LAST_7DAYS
-    - WHERE segments.date DURING LAST_30DAYS
+    - WHERE segments.date DURING LAST_7_DAYS
+    - WHERE segments.date DURING LAST_30_DAYS
     - WHERE segments.date BETWEEN '2023-01-01' AND '2023-01-31'
     
     ### Filtering
@@ -824,8 +848,8 @@ def google_ads_workflow() -> str:
        - Budgets
        - Conversions
     
-    Important: Always provide the customer_id as a string, even though it looks like a number.
-    For example: customer_id="1234567890" (not customer_id=1234567890)
+    Important: Always provide the customer_id as a string.
+    For example: customer_id="1234567890"
     """
 
 @mcp.prompt("gaql_help")
@@ -845,7 +869,7 @@ def gaql_help() -> str:
       metrics.cost_micros,
       metrics.conversions
     FROM campaign
-    WHERE segments.date DURING LAST_30DAYS
+    WHERE segments.date DURING LAST_30_DAYS
     ORDER BY metrics.cost_micros DESC
     ```
     
@@ -859,7 +883,7 @@ def gaql_help() -> str:
       metrics.cost_micros,
       metrics.conversions
     FROM keyword_view
-    WHERE segments.date DURING LAST_30DAYS
+    WHERE segments.date DURING LAST_30_DAYS
     ORDER BY metrics.clicks DESC
     ```
     
@@ -875,7 +899,7 @@ def gaql_help() -> str:
       metrics.conversions
     FROM ad_group_ad
     WHERE 
-      segments.date DURING LAST_30DAYS
+      segments.date DURING LAST_30_DAYS
       AND metrics.impressions > 1000
       AND metrics.ctr < 0.01
     ORDER BY metrics.impressions DESC
@@ -895,7 +919,7 @@ def gaql_help() -> str:
 
 @mcp.tool()
 async def get_image_assets(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     limit: int = Field(default=50, description="Maximum number of image assets to return")
 ) -> str:
     """
@@ -983,7 +1007,7 @@ async def get_image_assets(
 
 @mcp.tool()
 async def download_image_asset(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     asset_id: str = Field(description="The ID of the image asset to download"),
     output_dir: str = Field(default="./ad_images", description="Directory to save the downloaded image")
 ) -> str:
@@ -1073,7 +1097,7 @@ async def download_image_asset(
 
 @mcp.tool()
 async def get_asset_usage(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     asset_id: str = Field(default=None, description="Optional: specific asset ID to look up (leave empty to get all image assets)"),
     asset_type: str = Field(default="IMAGE", description="Asset type to search for ('IMAGE', 'TEXT', 'VIDEO', etc.)")
 ) -> str:
@@ -1244,7 +1268,7 @@ async def get_asset_usage(
 
 @mcp.tool()
 async def analyze_image_assets(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes) as a string"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     days: int = Field(default=30, description="Number of days to look back (7, 30, 90, etc.)")
 ) -> str:
     """
@@ -1397,7 +1421,9 @@ async def analyze_image_assets(
         return f"Error analyzing image assets: {str(e)}"
 
 @mcp.tool()
-async def list_resources(customer_id: str) -> str:
+async def list_resources(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'")
+) -> str:
     """
     List valid resources that can be used in GAQL FROM clauses.
     
