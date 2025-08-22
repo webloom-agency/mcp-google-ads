@@ -14,6 +14,8 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import PlainTextResponse
 
 # MCP
 from mcp.server.fastmcp import FastMCP
@@ -1314,7 +1316,38 @@ try:
 except Exception:
     pass
 
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        # Allow CORS preflight to pass through
+        if getattr(request, "method", "").upper() == "OPTIONS":
+            return await call_next(request)
+
+        token_expected = os.getenv("MCP_BEARER_TOKEN")
+        # If no token configured, do not enforce auth
+        if not token_expected:
+            return await call_next(request)
+
+        try:
+            path = request.url.path
+        except Exception:
+            path = ""
+
+        base_path = MCP_HTTP_PATH.rstrip("/")
+        # Protect only the MCP endpoints (e.g., /mcp, /mcp/sse, /mcp/messages)
+        if path == base_path or path.startswith(base_path + "/"):
+            auth_header = request.headers.get("authorization")
+            if not auth_header or not auth_header.startswith("Bearer "):
+                return PlainTextResponse("Unauthorized", status_code=401)
+            token = auth_header.split(" ", 1)[1]
+            if token != token_expected:
+                return PlainTextResponse("Forbidden", status_code=403)
+
+        return await call_next(request)
+
 app = mcp.streamable_http_app()
+
+# Add Bearer auth enforcement if MCP_BEARER_TOKEN is set
+app.add_middleware(BearerAuthMiddleware)
 
 # --- CORS for browser-based MCP clients (e.g., bolt.new / webcontainer) ---
 # Allow exact origins and a regex for ephemeral *.webcontainer-api.io subdomains.

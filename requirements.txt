@@ -16,3 +16,4 @@ pandas>=2.1.4
 
 # Web server for Render
 uvicorn>=0.30.0
+starlette>=0.37.2
