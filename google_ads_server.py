@@ -251,14 +251,20 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     """
     Returns a list of dicts: {id, name, manager, status, currency}.
     Caches for ACCOUNTS_CACHE_TTL_SECONDS to avoid rate limits.
+    Tries per-customer login header first to avoid "No valid session ID" errors.
     """
-    if (not force) and _accounts_cache["items"] and _now_s() - _accounts_cache["at"] < ACCOUNTS_CACHE_TTL_SECONDS:
+    if (
+        not force
+        and _accounts_cache["items"]
+        and _now_s() - _accounts_cache["at"] < ACCOUNTS_CACHE_TTL_SECONDS
+    ):
         return _accounts_cache["items"]
 
-    creds = get_credentials()
-    headers = get_headers(creds)
+    # Use any valid headers just to call listAccessibleCustomers
+    creds_root = get_credentials()
+    headers_root = get_headers(creds_root)
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
-    r = requests.get(url, headers=headers)
+    r = requests.get(url, headers=headers_root)
     if r.status_code != 200:
         raise RuntimeError(f"listAccessibleCustomers error [{r.status_code}]: {r.text}")
 
@@ -279,9 +285,35 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     for raw in ids:
         cid = normalize_customer_id(raw)
         u = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-        rr = requests.post(u, headers=headers, json={"query": q})
-        if rr.status_code == 200 and rr.json().get("results"):
-            c = rr.json()["results"][0].get("customer", {})
+
+        # --- Attempt 1: use login_customer_id = cid (often required) ---
+        try:
+            creds_1 = get_credentials()
+            headers_1 = get_headers(creds_1, login_customer_id=cid)
+            rr = requests.post(u, headers=headers_1, json={"query": q})
+        except Exception:
+            rr = None
+
+        # If attempt 1 failed or returned non-200, try env MCC as fallback
+        if not rr or rr.status_code != 200 or not rr.json().get("results"):
+            try:
+                creds_2 = get_credentials()
+                headers_2 = get_headers(creds_2)  # uses GOOGLE_ADS_LOGIN_CUSTOMER_ID
+                rr2 = requests.post(u, headers=headers_2, json={"query": q})
+            except Exception:
+                rr2 = None
+        else:
+            rr2 = None
+
+        # Prefer the first successful response
+        use_resp = None
+        if rr and rr.status_code == 200 and rr.json().get("results"):
+            use_resp = rr
+        elif rr2 and rr2.status_code == 200 and rr2.json().get("results"):
+            use_resp = rr2
+
+        if use_resp:
+            c = use_resp.json()["results"][0].get("customer", {})
             items.append({
                 "id": normalize_customer_id(c.get("id", cid)),
                 "name": c.get("descriptiveName", "") or "",
@@ -290,11 +322,28 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
                 "currency": c.get("currencyCode", ""),
             })
         else:
-            items.append({"id": cid, "name": "", "manager": None, "status": "", "currency": ""})
+            # Keep minimal info so fuzzy search can still work; include error text if any
+            err_txt = ""
+            try:
+                if rr and rr.text:
+                    err_txt = rr.text
+                elif rr2 and rr2.text:
+                    err_txt = rr2.text
+            except Exception:
+                pass
+            items.append({
+                "id": cid,
+                "name": "",
+                "manager": None,
+                "status": "",
+                "currency": "",
+                "error": err_txt
+            })
 
     _accounts_cache["items"] = items
     _accounts_cache["at"] = _now_s()
     return items
+
 
 def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
     """
