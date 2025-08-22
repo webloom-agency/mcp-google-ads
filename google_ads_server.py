@@ -1451,6 +1451,12 @@ async def list_resources(
     # Use your existing run_gaql function to execute this query
     return await run_gaql(customer_id, query)
 
+# --- add at the very end of google_ads_server.py ---
 if __name__ == "__main__":
-    # Start the MCP server on stdio transport
-    mcp.run(transport="stdio")
+    import os
+    # If running on Render, expose HTTP on the provided PORT
+    port = int(os.getenv("PORT", "8000"))
+    # Path can be customized; default to /mcp
+    path = os.getenv("MCP_HTTP_PATH", "/mcp")
+    # FastMCP: run the server over HTTP for web deployment
+    mcp.run(transport="http", host="0.0.0.0", port=port, path=path)
