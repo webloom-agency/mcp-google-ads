@@ -3,7 +3,6 @@ from pydantic import Field
 import os
 import json
 import requests
-from datetime import datetime, timedelta
 import re
 import time
 import difflib
@@ -52,11 +51,20 @@ GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", ""
 GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # 'oauth' or 'service_account'
 DEFAULT_GOOGLE_ADS_CUSTOMER_ID = os.environ.get("DEFAULT_GOOGLE_ADS_CUSTOMER_ID")  # optional default
 
-# Account index cache
+# Caches
 ACCOUNTS_CACHE_TTL_SECONDS = int(os.getenv("ACCOUNTS_CACHE_TTL_SECONDS", "900"))
-_accounts_cache: Dict[str, Any] = {"at": 0, "items": []}
+HIER_CACHE_TTL_SECONDS = int(os.getenv("HIER_CACHE_TTL_SECONDS", "900"))
+
+# Prefer hierarchy-based lookups for name → ID (recommended for big MCCs)
+USE_HIERARCHY_LOOKUP = os.getenv("USE_HIERARCHY_LOOKUP", "1") not in ("0", "false", "False")
+
+_accounts_cache: Dict[str, Any] = {"at": 0, "items": []}     # listAccessibleCustomers-based (fallback)
+_hierarchy_cache: Dict[str, Any] = {"at": 0, "items": []}    # customer_client-based (full subtree)
 
 # ----------------------------- HELPERS -----------------------------
+def _now_s() -> int:
+    return int(time.time())
+
 def normalize_customer_id(value: Optional[str]) -> str:
     """
     Accepts '123-456-7890' or '1234567890' and returns digits-only (10 chars).
@@ -80,9 +88,6 @@ def normalize_login_customer_id(value: Optional[str]) -> Optional[str]:
     if not re.fullmatch(r"\d{10}", digits):
         raise ValueError(f"Invalid login_customer_id: {value!r}. Expected 10 digits.")
     return digits
-
-def _now_s() -> int:
-    return int(time.time())
 
 def get_credentials():
     """
@@ -246,12 +251,101 @@ def get_headers(creds, *, login_customer_id: Optional[str] = None):
 
     return headers
 
-# ----------------------------- ACCOUNT INDEX + NAME/ID RESOLUTION -----------------------------
+# ----------------------------- GAQL SEARCH (pagination helper) -----------------------------
+def _gaql_search_all(cid: str, query: str, headers: Dict[str, str], page_size: int = 10000) -> List[Dict[str, Any]]:
+    """
+    Fetch all rows for a GAQL query using googleAds:search pagination.
+    """
+    url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+    results: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+
+    while True:
+        payload = {"query": query, "pageSize": page_size}
+        if page_token:
+            payload["pageToken"] = page_token
+        r = requests.post(url, headers=headers, json=payload)
+        if r.status_code != 200:
+            raise RuntimeError(f"GAQL search error [{r.status_code}]: {r.text}")
+        data = r.json()
+        results.extend(data.get("results", []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return results
+
+# ----------------------------- ACCOUNT INDEXES -----------------------------
+def get_full_hierarchy_index(
+    force: bool = False,
+    include_managers: bool = True,
+    include_hidden: bool = False,
+    max_level: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Returns the FULL subtree under the umbrella MCC in env (GOOGLE_ADS_LOGIN_CUSTOMER_ID),
+    using customer_client. Much more complete than listAccessibleCustomers.
+    """
+    if (
+        not force
+        and _hierarchy_cache["items"]
+        and _now_s() - _hierarchy_cache["at"] < HIER_CACHE_TTL_SECONDS
+    ):
+        return _hierarchy_cache["items"]
+
+    root_id = normalize_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
+    creds = get_credentials()
+    headers = get_headers(creds, login_customer_id=root_id)
+
+    where_status = "" if include_hidden else " AND customer_client.status = 'ENABLED'"
+    query = f"""
+        SELECT
+          customer_client.id,
+          customer_client.descriptive_name,
+          customer_client.manager,
+          customer_client.level,
+          customer_client.status,
+          customer_client.currency_code
+        FROM customer_client
+        WHERE customer_client.level <= {int(max_level)}
+        {where_status}
+        ORDER BY customer_client.level, customer_client.descriptive_name
+    """.strip()
+
+    try:
+        rows = _gaql_search_all(root_id, query, headers)
+    except Exception as e:
+        # Fallback: return empty (caller can fallback to listAccessibleCustomers)
+        logger.error(f"Hierarchy GAQL failed: {e}")
+        rows = []
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        cc = row.get("customerClient", {})
+        cid = normalize_customer_id(cc.get("id", ""))
+        name = cc.get("descriptiveName", "") or ""
+        manager = bool(cc.get("manager", False))
+        level = cc.get("level", 0)
+        status = cc.get("status", "")
+        currency = cc.get("currencyCode", "")
+        if (not include_managers) and manager:
+            continue
+        items.append({
+            "id": cid,
+            "name": name,
+            "manager": manager,
+            "status": status,
+            "currency": currency,
+            "level": level
+        })
+
+    _hierarchy_cache["items"] = items
+    _hierarchy_cache["at"] = _now_s()
+    return items
+
 def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     """
-    Returns a list of dicts: {id, name, manager, status, currency}.
-    Caches for ACCOUNTS_CACHE_TTL_SECONDS to avoid rate limits.
-    Tries per-customer login header first to avoid "No valid session ID" errors.
+    Fallback (listAccessibleCustomers + per-customer name fetch).
+    Kept for completeness if you disable hierarchy lookup.
     """
     if (
         not force
@@ -260,7 +354,6 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     ):
         return _accounts_cache["items"]
 
-    # Use any valid headers just to call listAccessibleCustomers
     creds_root = get_credentials()
     headers_root = get_headers(creds_root)
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
@@ -286,26 +379,23 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
         cid = normalize_customer_id(raw)
         u = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
-        # --- Attempt 1: use login_customer_id = cid (often required) ---
+        # Attempt 1: login_customer_id = cid
         try:
-            creds_1 = get_credentials()
-            headers_1 = get_headers(creds_1, login_customer_id=cid)
+            headers_1 = get_headers(get_credentials(), login_customer_id=cid)
             rr = requests.post(u, headers=headers_1, json={"query": q})
         except Exception:
             rr = None
 
-        # If attempt 1 failed or returned non-200, try env MCC as fallback
+        # Attempt 2: fallback to env MCC
         if not rr or rr.status_code != 200 or not rr.json().get("results"):
             try:
-                creds_2 = get_credentials()
-                headers_2 = get_headers(creds_2)  # uses GOOGLE_ADS_LOGIN_CUSTOMER_ID
+                headers_2 = get_headers(get_credentials())  # uses env MCC
                 rr2 = requests.post(u, headers=headers_2, json={"query": q})
             except Exception:
                 rr2 = None
         else:
             rr2 = None
 
-        # Prefer the first successful response
         use_resp = None
         if rr and rr.status_code == 200 and rr.json().get("results"):
             use_resp = rr
@@ -322,7 +412,6 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
                 "currency": c.get("currencyCode", ""),
             })
         else:
-            # Keep minimal info so fuzzy search can still work; include error text if any
             err_txt = ""
             try:
                 if rr and rr.text:
@@ -344,7 +433,17 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     _accounts_cache["at"] = _now_s()
     return items
 
+def _active_index(force: bool = False) -> List[Dict[str, Any]]:
+    """
+    Choose which index to use (hierarchy preferred).
+    """
+    if USE_HIERARCHY_LOOKUP:
+        items = get_full_hierarchy_index(force=force, include_managers=True, include_hidden=False, max_level=10)
+        if items:
+            return items
+    return get_accounts_index(force=force)
 
+# ----------------------------- NAME/ID RESOLUTION -----------------------------
 def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
     """
     Accepts ID (with/without dashes) or account name (approximate).
@@ -356,7 +455,7 @@ def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
       4) Fuzzy name match with low cutoff (0.3)
       5) Best SequenceMatcher score (no cutoff)
     """
-    # 1) Already looks like an ID?
+    # 1) Already an ID?
     try:
         return normalize_customer_id(identifier)
     except Exception:
@@ -366,7 +465,7 @@ def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
     if not q:
         raise ValueError("Empty account identifier.")
 
-    accounts = get_accounts_index()
+    accounts = _active_index(force=False)
 
     # 2) Exact name match
     exact = [a for a in accounts if (a.get("name") or "").lower() == q]
@@ -388,59 +487,56 @@ def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
 
     # 4) Fuzzy (lower cutoff)
     names = [a["name"] for a in accounts if a.get("name")]
-    try:
-        import difflib
-        candidates = difflib.get_close_matches(identifier, names, n=5, cutoff=0.3)
-        if candidates:
-            cand_rows = [a for a in accounts if a.get("name") in candidates]
-            if prefer_non_manager:
-                for a in cand_rows:
-                    if not a.get("manager"):
-                        return a["id"]
-            return cand_rows[0]["id"]
-    except Exception:
-        pass
+    candidates = difflib.get_close_matches(identifier, names, n=5, cutoff=0.3)
+    if candidates:
+        cand_rows = [a for a in accounts if a.get("name") in candidates]
+        if prefer_non_manager:
+            for a in cand_rows:
+                if not a.get("manager"):
+                    return a["id"]
+        return cand_rows[0]["id"]
 
-    # 5) Best score, no cutoff
-    try:
-        import difflib
-        best_row = None
-        best_score = -1.0
-        for a in accounts:
-            nm = a.get("name") or ""
-            score = difflib.SequenceMatcher(None, q, nm.lower()).ratio()
-            # prefer non-MCC if scores are equal within a tiny epsilon
-            if (score > best_score) or (abs(score - best_score) < 1e-9 and best_row and best_row.get("manager") and not a.get("manager")):
-                best_score = score
-                best_row = a
-        if best_row:
-            return best_row["id"]
-    except Exception:
-        pass
+    # 5) Best score across all names
+    best_row = None
+    best_score = -1.0
+    for a in accounts:
+        nm = a.get("name") or ""
+        score = difflib.SequenceMatcher(None, q, nm.lower()).ratio()
+        if (score > best_score) or (abs(score - best_score) < 1e-9 and best_row and best_row.get("manager") and not a.get("manager")):
+            best_score = score
+            best_row = a
+    if best_row:
+        return best_row["id"]
 
     raise ValueError(f"No account found matching name or ID: {identifier!r}")
-
 
 # ----------------------------- TOOLS -----------------------------
 @mcp.tool()
 async def list_accounts(
-    force_refresh: bool = Field(default=False, description="Set true to refresh the accounts cache")
+    force_refresh: bool = Field(default=False, description="Refresh the cache"),
+    use_hierarchy: bool = Field(default=True, description="If true, list from the full hierarchy under the umbrella MCC")
 ) -> str:
     """
     Lists accessible accounts with name, ID, MCC flag, and currency.
     """
     try:
-        items = get_accounts_index(force=force_refresh)
+        items = get_full_hierarchy_index(force=force_refresh, include_managers=True, include_hidden=False, max_level=10) \
+            if use_hierarchy else get_accounts_index(force=force_refresh)
         if not items:
             return "No accessible accounts found."
 
-        lines = ["Accessible Google Ads Accounts:", "-" * 70]
-        items_sorted = sorted(items, key=lambda x: (x["manager"] is True, (x["name"] or "").lower(), x["id"]))
+        # Some indexes may not include 'level' (fallback path)
+        for it in items:
+            it.setdefault("level", 0)
+
+        lines = ["Accessible Google Ads Accounts:", "-" * 80]
+        items_sorted = sorted(items, key=lambda x: (x.get("level", 0), (x["manager"] is True), (x.get("name") or "").lower(), x["id"]))
         for a in items_sorted:
             tag = "MCC" if a["manager"] else "Client"
             nm = a["name"] or "(no name)"
             cur = f" · {a['currency']}" if a.get("currency") else ""
-            lines.append(f"{nm} — {a['id']} [{tag}]{cur}")
+            lvl = f" · L{a.get('level', 0)}"
+            lines.append(f"{nm} — {a['id']} [{tag}{lvl}]{cur}")
         return "\n".join(lines)
     except Exception as e:
         return f"Error listing accounts: {str(e)}"
@@ -451,19 +547,18 @@ async def find_account(
     top_k: int = Field(default=5, ge=1, le=20, description="Max results to return")
 ) -> str:
     """
-    Fuzzy-search accounts by name or normalize an ID.
+    Fuzzy-search accounts by name or normalize an ID (using full hierarchy index).
     """
     try:
-        # If it's an ID, show the matching row
         rows = []
         try:
             cid = normalize_customer_id(query)
-            rows = [a for a in get_accounts_index() if a["id"] == cid]
+            rows = [a for a in _active_index() if a["id"] == cid]
         except Exception:
-            all_rows = get_accounts_index()
+            all_rows = _active_index()
             scored = []
             for a in all_rows:
-                nm = a["name"] or ""
+                nm = a.get("name") or ""
                 score = difflib.SequenceMatcher(None, query.lower(), nm.lower()).ratio()
                 scored.append((score, a))
             scored.sort(key=lambda x: x[0], reverse=True)
@@ -475,11 +570,130 @@ async def find_account(
         for a in rows[:top_k]:
             tag = "MCC" if a["manager"] else "Client"
             nm = a["name"] or "(no name)"
-            out.append(f"{nm} — {a['id']} [{tag}]")
+            lvl = f" · L{a.get('level', 0)}" if a.get("level") is not None else ""
+            out.append(f"{nm} — {a['id']} [{tag}{lvl}]")
         return "\n".join(out)
     except Exception as e:
         return f"Error: {str(e)}"
 
+@mcp.tool()
+async def list_accounts_hierarchy(
+    root: str = Field(default="", description="MCC name or ID to start from. Empty = env GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
+    max_level: int = Field(default=10, ge=1, le=10, description="Depth to traverse (1..10)"),
+    include_managers: bool = Field(default=True, description="Include MCCs in the output"),
+    include_hidden: bool = Field(default=False, description="Include CANCELLED/UNSPECIFIED statuses")
+) -> str:
+    """
+    Lists the account hierarchy from a manager (MCC) using customer_client.
+    """
+    try:
+        root_id = coerce_customer_id(root, prefer_non_manager=False) if root else normalize_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
+        creds = get_credentials()
+        headers = get_headers(creds, login_customer_id=root_id)
+
+        status_filter = "" if include_hidden else " AND customer_client.status = 'ENABLED'"
+        query = f"""
+            SELECT
+              customer_client.id,
+              customer_client.descriptive_name,
+              customer_client.manager,
+              customer_client.level,
+              customer_client.status,
+              customer_client.currency_code
+            FROM customer_client
+            WHERE customer_client.level <= {int(max_level)}
+            {status_filter}
+            ORDER BY customer_client.level, customer_client.manager DESC, customer_client.descriptive_name
+        """
+
+        rows = _gaql_search_all(root_id, query, headers)
+        if not rows:
+            return f"No accounts found under MCC {root_id}."
+
+        lines = [f"Hierarchy under {root_id} (level ≤ {max_level}):", "-" * 90]
+        count_total = 0
+        count_clients = 0
+        count_mcc = 0
+
+        for row in rows:
+            cc = row.get("customerClient", {})
+            cid = normalize_customer_id(cc.get("id", ""))
+            name = cc.get("descriptiveName", "") or "(no name)"
+            manager = bool(cc.get("manager", False))
+            level = cc.get("level", 0)
+            status = cc.get("status", "")
+            currency = cc.get("currencyCode", "")
+            if (not include_managers) and manager:
+                continue
+            tag = "MCC" if manager else "Client"
+            indent = "  " * int(level)
+            cur = f" · {currency}" if currency else ""
+            lines.append(f"{indent}{name} — {cid} [{tag} · {status} · L{level}]{cur}")
+            count_total += 1
+            if manager:
+                count_mcc += 1
+            else:
+                count_clients += 1
+
+        lines.append("-" * 90)
+        lines.append(f"Total: {count_total} (Clients: {count_clients}, MCCs: {count_mcc})")
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error listing hierarchy: {str(e)}"
+
+@mcp.tool()
+async def list_manager_clients(
+    manager_id: str = Field(description="MCC ID or name (e.g., 879-804-8996)"),
+    level: int = Field(default=1, ge=0, le=10, description="Depth to include (0=self only, 1=direct children, ... )"),
+    enabled_only: bool = Field(default=True, description="Only include ENABLED accounts")
+) -> str:
+    """
+    Lists client accounts under the given MCC using customer_client.
+    """
+    try:
+        root_id = coerce_customer_id(manager_id, prefer_non_manager=False)
+        creds = get_credentials()
+        headers = get_headers(creds, login_customer_id=root_id)
+
+        where_status = "" if not enabled_only else " AND customer_client.status = 'ENABLED'"
+        query = f"""
+            SELECT
+              customer_client.id,
+              customer_client.descriptive_name,
+              customer_client.manager,
+              customer_client.level,
+              customer_client.status,
+              customer_client.currency_code
+            FROM customer_client
+            WHERE customer_client.level <= {int(level)}
+            {where_status}
+            ORDER BY customer_client.level, customer_client.descriptive_name
+        """
+
+        rows = _gaql_search_all(root_id, query, headers)
+        if not rows:
+            return f"No clients found under MCC {root_id}."
+
+        out = [f"Accounts under {root_id} (level ≤ {level}):", "-"*90]
+        for row in rows:
+            cc = row.get("customerClient", {})
+            cid = normalize_customer_id(cc.get("id", ""))
+            name = cc.get("descriptiveName", "") or "(no name)"
+            manager = bool(cc.get("manager", False))
+            lvl = cc.get("level", 0)
+            status = cc.get("status", "")
+            cur = cc.get("currencyCode", "")
+            tag = "MCC" if manager else "Client"
+            indent = "  " * int(lvl)
+            cur_s = f" · {cur}" if cur else ""
+            out.append(f"{indent}{name} — {cid} [{tag} · {status} · L{lvl}]{cur_s}")
+        return "\n".join(out)
+
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# ------- Query tools (all accept name or ID; prefer non-MCC automatically) -------
 @mcp.tool()
 async def execute_gaql_query(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
@@ -495,9 +709,7 @@ async def execute_gaql_query(
         headers = get_headers(creds, login_customer_id=login_customer_id)
 
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-        payload = {"query": query}
-        response = requests.post(url, headers=headers, json=payload)
-
+        response = requests.post(url, headers=headers, json={"query": query})
         if response.status_code != 200:
             return f"Error executing query [{response.status_code}]: {response.text}"
 
@@ -505,7 +717,6 @@ async def execute_gaql_query(
         if not results.get('results'):
             return "No results found for the query."
 
-        # Build simple table from first row
         first = results['results'][0]
         fields: List[str] = []
         for k, v in first.items():
@@ -518,7 +729,6 @@ async def execute_gaql_query(
         lines = [f"Query Results for Account {cid}:", "-" * 80]
         lines.append(" | ".join(fields))
         lines.append("-" * 80)
-
         for row in results['results']:
             row_vals = []
             for field in fields:
@@ -602,10 +812,8 @@ async def run_gaql(
         creds = get_credentials()
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id)
-
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
         response = requests.post(url, headers=headers, json={"query": query})
-
         if response.status_code != 200:
             return f"Error executing query [{response.status_code}]: {response.text}"
 
@@ -616,7 +824,6 @@ async def run_gaql(
         if format.lower() == "json":
             return json.dumps(results, indent=2)
 
-        # Build fields
         first = results['results'][0]
         fields: List[str] = []
         for k, v in first.items():
@@ -640,7 +847,7 @@ async def run_gaql(
                 csv_lines.append(",".join(row_vals))
             return "\n".join(csv_lines)
 
-        # Default: table with widths
+        # table
         lines = [f"Query Results for Account {cid}:", "-" * 100]
         widths = {f: len(f) for f in fields}
         for row in results['results']:
@@ -697,7 +904,6 @@ async def get_ad_creatives(
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
         response = requests.post(url, headers=headers, json={"query": query})
-
         if response.status_code != 200:
             return f"Error retrieving ad creatives [{response.status_code}]: {response.text}"
 
@@ -1067,52 +1273,24 @@ async def analyze_image_assets(
     except Exception as e:
         return f"Error analyzing image assets: {str(e)}"
 
-@mcp.tool()
-async def list_resources(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
-) -> str:
-    query = """
-        SELECT
-            google_ads_field.name,
-            google_ads_field.category,
-            google_ads_field.data_type
-        FROM google_ads_field
-        WHERE google_ads_field.category = 'RESOURCE'
-        ORDER BY google_ads_field.name
-    """
-    return await run_gaql(customer_id, query, "table", login_customer_id)
-
-
-@mcp.tool()
-async def debug_accounts_index() -> str:
-    items = get_accounts_index(force=False)
-    if not items:
-        return "No accounts."
-    lines = ["Accounts cache:", "-"*60]
-    for a in items:
-        tag = "MCC" if a.get("manager") else "Client"
-        nm = a.get("name") or "(no name)"
-        lines.append(f"{nm} — {a['id']} [{tag}]")
-    return "\n".join(lines)
-
 # ----------------------------- MCP RESOURCES & PROMPTS -----------------------------
 @mcp.resource("gaql://reference")
 def gaql_reference() -> str:
     return """
     # Google Ads Query Language (GAQL) Reference (short)
     SELECT field1, field2 FROM resource WHERE condition ORDER BY field LIMIT n
-    Common resources: campaign, ad_group, ad_group_ad, asset, customer, keyword_view, etc.
+    Common resources: campaign, ad_group, ad_group_ad, asset, customer, keyword_view, customer_client, etc.
     Date ranges: LAST_7_DAYS, LAST_14_DAYS, LAST_30_DAYS, LAST_90_DAYS, ...
     """
 
 @mcp.prompt("google_ads_workflow")
 def google_ads_workflow() -> str:
     return """
-    1) list_accounts()
+    1) list_accounts(use_hierarchy=true)
     2) get_account_currency(customer_id="name or ID")
     3) get_campaign_performance / get_ad_performance / get_ad_creatives
     4) run_gaql(customer_id="name or ID", query="...")
+    5) list_accounts_hierarchy(root="", max_level=10) for full tree
     """
 
 @mcp.prompt("gaql_help")
