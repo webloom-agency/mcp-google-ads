@@ -898,8 +898,24 @@ async def list_resources(
     """
     return await run_gaql(customer_id, query, "table", login_customer_id)
 
-# --- HTTP runner for Render ---
+# --- HTTP app for Render (use uvicorn to serve) ---
+# Configure the path where the MCP endpoint will live (default /mcp)
+MCP_HTTP_PATH = os.getenv("MCP_HTTP_PATH", "/mcp")
+
+# If you want the path applied at init-time, you can set it here, e.g.:
+#   mcp = FastMCP("google-ads-server", streamable_http_path=MCP_HTTP_PATH)
+# If your FastMCP was already created above, set it like this:
+try:
+    # Works on recent FastMCP versions
+    mcp.settings.streamable_http_path = MCP_HTTP_PATH  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+# Expose an ASGI app that uvicorn can serve
+app = mcp.streamable_http_app()
+
 if __name__ == "__main__":
+    # Local dev convenience: run with uvicorn if you launch the file directly
+    import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    path = os.getenv("MCP_HTTP_PATH", "/mcp")
-    mcp.run(transport="http", port=port, path=path)
+    uvicorn.run("google_ads_server:app", host="0.0.0.0", port=port, reload=False)
