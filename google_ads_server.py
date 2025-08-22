@@ -78,22 +78,21 @@ def normalize_login_customer_id(value: Optional[str]) -> Optional[str]:
 
 def get_credentials():
     """
-    Get and refresh OAuth credentials or service account credentials based on the auth type.
+    Get credentials based on GOOGLE_ADS_AUTH_TYPE.
+    - service_account: requires GOOGLE_ADS_CREDENTIALS_PATH (SA JSON)
+    - oauth: prefer env-based refresh-token; else token file; else interactive (local only)
     """
-    if not GOOGLE_ADS_CREDENTIALS_PATH:
-        raise ValueError("GOOGLE_ADS_CREDENTIALS_PATH environment variable not set")
-
     auth_type = GOOGLE_ADS_AUTH_TYPE.lower()
     logger.info(f"Using authentication type: {auth_type}")
 
     if auth_type == "service_account":
-        try:
-            return get_service_account_credentials()
-        except Exception as e:
-            logger.error(f"Error with service account authentication: {str(e)}")
-            raise
+        if not GOOGLE_ADS_CREDENTIALS_PATH:
+            raise ValueError("GOOGLE_ADS_CREDENTIALS_PATH must point to your service account JSON when using service_account auth.")
+        return get_service_account_credentials()
 
+    # OAuth path
     return get_oauth_credentials()
+
 
 def get_service_account_credentials():
     """Get credentials using a service account key file."""
@@ -117,79 +116,104 @@ def get_service_account_credentials():
         raise
 
 def get_oauth_credentials():
-    """Get and refresh OAuth user credentials."""
-    creds = None
-    client_config = None
+    """
+    Headless-friendly OAuth:
+    1) If REFRESH TOKEN + CLIENT_ID + CLIENT_SECRET exist in env, build creds directly.
+    2) Else, try token file at GOOGLE_ADS_CREDENTIALS_PATH (if set).
+    3) Else, fall back to interactive InstalledAppFlow (local dev only).
+    """
+    # 1) Env-based creds (best for Render)
+    env_client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
+    env_client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
+    env_refresh_token = os.environ.get("GOOGLE_ADS_REFRESH_TOKEN")
 
-    token_path = GOOGLE_ADS_CREDENTIALS_PATH
-    if os.path.exists(token_path) and not os.path.basename(token_path).endswith('.json'):
-        token_dir = os.path.dirname(token_path)
-        token_path = os.path.join(token_dir, 'google_ads_token.json')
-
-    if os.path.exists(token_path):
+    if env_client_id and env_client_secret and env_refresh_token:
+        logger.info("Building OAuth credentials from environment (refresh token).")
+        creds = Credentials(
+            token=None,
+            refresh_token=env_refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=env_client_id,
+            client_secret=env_client_secret,
+            scopes=SCOPES,
+        )
+        # Pre-fetch access token so headers work immediately
         try:
-            logger.info(f"Loading OAuth credentials from {token_path}")
+            creds.refresh(Request())
+        except Exception as e:
+            logger.error(f"Failed to refresh OAuth token from env: {e}")
+            raise
+        return creds
+
+    # 2) Token file (works locally or with Secret Files)
+    token_path = None
+    if GOOGLE_ADS_CREDENTIALS_PATH:
+        token_path = GOOGLE_ADS_CREDENTIALS_PATH
+        if os.path.exists(token_path) and not os.path.basename(token_path).endswith('.json'):
+            token_dir = os.path.dirname(token_path)
+            token_path = os.path.join(token_dir, 'google_ads_token.json')
+
+    if token_path and os.path.exists(token_path):
+        try:
+            logger.info(f"Loading OAuth credentials from file: {token_path}")
             with open(token_path, 'r') as f:
                 creds_data = json.load(f)
-                if "installed" in creds_data or "web" in creds_data:
-                    client_config = creds_data
-                    logger.info("Found OAuth client configuration")
-                else:
-                    logger.info("Found existing OAuth token")
+                # If this looks like a saved user token (has refresh_token), use it directly
+                if "refresh_token" in creds_data or "access_token" in creds_data:
                     creds = Credentials.from_authorized_user_info(creds_data, SCOPES)
-        except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON in token file: {token_path}")
-            creds = None
+                    if not creds.valid:
+                        try:
+                            creds.refresh(Request())
+                        except Exception as e:
+                            logger.error(f"Failed to refresh token from file: {e}")
+                            raise
+                    return creds
+                # Otherwise treat as OAuth client config and run flow (local only)
+                client_config = creds_data
         except Exception as e:
-            logger.warning(f"Error loading credentials: {str(e)}")
-            creds = None
+            logger.warning(f"Could not load token from file: {e}")
+            # fall through to interactive flow
+    else:
+        client_config = None
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and getattr(creds, "refresh_token", None):
-            try:
-                logger.info("Refreshing expired token")
-                creds.refresh(Request())
-                logger.info("Token successfully refreshed")
-            except RefreshError as e:
-                logger.warning(f"Error refreshing token: {str(e)}, will try to get new token")
-                creds = None
-            except Exception as e:
-                logger.error(f"Unexpected error refreshing token: {str(e)}")
-                raise
+    # 3) Interactive (local dev only). Not suitable for Render.
+    logger.info("Falling back to interactive OAuth flow (local dev).")
+    if not client_config:
+        client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
+        client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            raise ValueError(
+                "For OAuth you must either provide CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN in env, "
+                "or set GOOGLE_ADS_CREDENTIALS_PATH to a token JSON, "
+                "or run the interactive flow locally with CLIENT_ID/SECRET."
+            )
+        client_config = {
+            "installed": {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
+            }
+        }
 
-        if not creds:
-            if not client_config:
-                logger.info("Creating OAuth client config from environment variables")
-                client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
-                client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
-
-                if not client_id or not client_secret:
-                    raise ValueError("GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET must be set if no client config file exists")
-
-                client_config = {
-                    "installed": {
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                        "token_uri": "https://oauth2.googleapis.com/token",
-                        "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
-                    }
-                }
-
-            logger.info("Starting OAuth authentication flow")
-            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-            creds = flow.run_local_server(port=0)
-            logger.info("OAuth flow completed successfully")
-
-        try:
-            logger.info(f"Saving credentials to {token_path}")
-            os.makedirs(os.path.dirname(token_path), exist_ok=True)
-            with open(token_path, 'w') as f:
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+    creds = flow.run_local_server(port=0)
+    # Optional: save to file if a path is configured
+    try:
+        if GOOGLE_ADS_CREDENTIALS_PATH:
+            out_path = GOOGLE_ADS_CREDENTIALS_PATH
+            if os.path.isdir(out_path):
+                out_path = os.path.join(out_path, "google_ads_token.json")
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, "w") as f:
                 f.write(creds.to_json())
-        except Exception as e:
-            logger.warning(f"Could not save credentials: {str(e)}")
+            logger.info(f"Saved OAuth token to {out_path}")
+    except Exception as e:
+        logger.warning(f"Could not save OAuth token to file: {e}")
 
     return creds
+
 
 def get_headers(creds, *, login_customer_id: Optional[str] = None):
     """
