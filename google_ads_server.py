@@ -13,6 +13,7 @@ from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
+from starlette.middleware.cors import CORSMiddleware
 
 # MCP
 from mcp.server.fastmcp import FastMCP
@@ -1314,6 +1315,23 @@ except Exception:
     pass
 
 app = mcp.streamable_http_app()
+
+# --- CORS for browser-based MCP clients (e.g., bolt.new / webcontainer) ---
+# Allow exact origins and a regex for ephemeral *.webcontainer-api.io subdomains.
+# You can also widen to ["*"] while testing.
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv(
+    "MCP_CORS_ORIGINS",
+    "https://bolt.new"
+).split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 if __name__ == "__main__":
     # Local dev convenience (Render should run uvicorn externally)
