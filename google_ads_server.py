@@ -252,26 +252,31 @@ def get_headers(creds, *, login_customer_id: Optional[str] = None):
     return headers
 
 # ----------------------------- GAQL SEARCH (pagination helper) -----------------------------
-def _gaql_search_all(cid: str, query: str, headers: Dict[str, str], page_size: int = 10000) -> List[Dict[str, Any]]:
+def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Fetch all rows for a GAQL query using googleAds:search pagination.
+    Note: For Google Ads API v19, page size is fixed by the API (10,000).
+    Setting pageSize triggers PAGE_SIZE_NOT_SUPPORTED, so we do NOT send it.
     """
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
     results: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
 
     while True:
-        payload = {"query": query, "pageSize": page_size}
+        payload: Dict[str, Any] = {"query": query}
         if page_token:
             payload["pageToken"] = page_token
+
         r = requests.post(url, headers=headers, json=payload)
         if r.status_code != 200:
             raise RuntimeError(f"GAQL search error [{r.status_code}]: {r.text}")
+
         data = r.json()
         results.extend(data.get("results", []))
         page_token = data.get("nextPageToken")
         if not page_token:
             break
+
     return results
 
 # ----------------------------- ACCOUNT INDEXES -----------------------------
