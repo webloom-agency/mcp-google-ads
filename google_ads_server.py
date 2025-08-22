@@ -902,4 +902,4 @@ async def list_resources(
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     path = os.getenv("MCP_HTTP_PATH", "/mcp")
-    mcp.run(transport="http", host="0.0.0.0", port=port, path=path)
+    mcp.run(transport="http", port=port, path=path)
