@@ -1,25 +1,28 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 from pydantic import Field
 import os
 import json
 import requests
 from datetime import datetime, timedelta
 import re
+import time
+import difflib
+import logging
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
-import logging
 
 # MCP
 from mcp.server.fastmcp import FastMCP
 
-# Configure logging
+# ----------------------------- LOGGING -----------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('google_ads_server')
 
+# ----------------------------- MCP APP -----------------------------
 mcp = FastMCP(
     "google-ads-server",
     dependencies=[
@@ -30,11 +33,11 @@ mcp = FastMCP(
     ]
 )
 
-# Constants and configuration
+# ----------------------------- CONSTANTS -----------------------------
 SCOPES = ['https://www.googleapis.com/auth/adwords']
-API_VERSION = "v19"  # Google Ads API version
+API_VERSION = "v19"  # keep aligned with your Google Ads API
 
-# Load environment variables
+# Load environment variables (optional)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -42,20 +45,24 @@ try:
 except ImportError:
     logger.warning("python-dotenv not installed, skipping .env file loading")
 
-# Get credentials from environment variables
+# Core env
 GOOGLE_ADS_CREDENTIALS_PATH = os.environ.get("GOOGLE_ADS_CREDENTIALS_PATH")
 GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
 GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
-GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # oauth or service_account
-DEFAULT_GOOGLE_ADS_CUSTOMER_ID = os.environ.get("DEFAULT_GOOGLE_ADS_CUSTOMER_ID")  # optional
+GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # 'oauth' or 'service_account'
+DEFAULT_GOOGLE_ADS_CUSTOMER_ID = os.environ.get("DEFAULT_GOOGLE_ADS_CUSTOMER_ID")  # optional default
 
+# Account index cache
+ACCOUNTS_CACHE_TTL_SECONDS = int(os.getenv("ACCOUNTS_CACHE_TTL_SECONDS", "900"))
+_accounts_cache: Dict[str, Any] = {"at": 0, "items": []}
+
+# ----------------------------- HELPERS -----------------------------
 def normalize_customer_id(value: Optional[str]) -> str:
     """
     Accepts '123-456-7890' or '1234567890' and returns digits-only (10 chars).
     Raises ValueError on missing/malformed.
     """
     if value is None or str(value).strip() == "":
-        # allow fallback to default env if present
         if DEFAULT_GOOGLE_ADS_CUSTOMER_ID:
             value = DEFAULT_GOOGLE_ADS_CUSTOMER_ID
         else:
@@ -66,15 +73,16 @@ def normalize_customer_id(value: Optional[str]) -> str:
     return digits
 
 def normalize_login_customer_id(value: Optional[str]) -> Optional[str]:
-    """
-    Normalize optional MCC/login ID. Returns digits-only or None if not provided.
-    """
+    """Normalize optional MCC/login ID. Returns digits-only or None if not provided."""
     if not value:
         return None
     digits = re.sub(r"\D", "", str(value))
     if not re.fullmatch(r"\d{10}", digits):
         raise ValueError(f"Invalid login_customer_id: {value!r}. Expected 10 digits.")
     return digits
+
+def _now_s() -> int:
+    return int(time.time())
 
 def get_credentials():
     """
@@ -90,9 +98,8 @@ def get_credentials():
             raise ValueError("GOOGLE_ADS_CREDENTIALS_PATH must point to your service account JSON when using service_account auth.")
         return get_service_account_credentials()
 
-    # OAuth path
+    # OAuth by default
     return get_oauth_credentials()
-
 
 def get_service_account_credentials():
     """Get credentials using a service account key file."""
@@ -122,7 +129,6 @@ def get_oauth_credentials():
     2) Else, try token file at GOOGLE_ADS_CREDENTIALS_PATH (if set).
     3) Else, fall back to interactive InstalledAppFlow (local dev only).
     """
-    # 1) Env-based creds (best for Render)
     env_client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
     env_client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
     env_refresh_token = os.environ.get("GOOGLE_ADS_REFRESH_TOKEN")
@@ -137,7 +143,6 @@ def get_oauth_credentials():
             client_secret=env_client_secret,
             scopes=SCOPES,
         )
-        # Pre-fetch access token so headers work immediately
         try:
             creds.refresh(Request())
         except Exception as e:
@@ -145,7 +150,7 @@ def get_oauth_credentials():
             raise
         return creds
 
-    # 2) Token file (works locally or with Secret Files)
+    # Fallback: token file
     token_path = None
     if GOOGLE_ADS_CREDENTIALS_PATH:
         token_path = GOOGLE_ADS_CREDENTIALS_PATH
@@ -153,35 +158,26 @@ def get_oauth_credentials():
             token_dir = os.path.dirname(token_path)
             token_path = os.path.join(token_dir, 'google_ads_token.json')
 
+    client_config = None
     if token_path and os.path.exists(token_path):
         try:
             logger.info(f"Loading OAuth credentials from file: {token_path}")
             with open(token_path, 'r') as f:
                 creds_data = json.load(f)
-                # If this looks like a saved user token (has refresh_token), use it directly
                 if "refresh_token" in creds_data or "access_token" in creds_data:
                     creds = Credentials.from_authorized_user_info(creds_data, SCOPES)
                     if not creds.valid:
-                        try:
-                            creds.refresh(Request())
-                        except Exception as e:
-                            logger.error(f"Failed to refresh token from file: {e}")
-                            raise
+                        creds.refresh(Request())
                     return creds
-                # Otherwise treat as OAuth client config and run flow (local only)
-                client_config = creds_data
+                else:
+                    client_config = creds_data
         except Exception as e:
             logger.warning(f"Could not load token from file: {e}")
-            # fall through to interactive flow
-    else:
-        client_config = None
 
-    # 3) Interactive (local dev only). Not suitable for Render.
+    # Interactive (local only)
     logger.info("Falling back to interactive OAuth flow (local dev).")
     if not client_config:
-        client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
-        client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
-        if not client_id or not client_secret:
+        if not env_client_id or not env_client_secret:
             raise ValueError(
                 "For OAuth you must either provide CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN in env, "
                 "or set GOOGLE_ADS_CREDENTIALS_PATH to a token JSON, "
@@ -189,8 +185,8 @@ def get_oauth_credentials():
             )
         client_config = {
             "installed": {
-                "client_id": client_id,
-                "client_secret": client_secret,
+                "client_id": env_client_id,
+                "client_secret": env_client_secret,
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
                 "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
@@ -199,7 +195,7 @@ def get_oauth_credentials():
 
     flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
     creds = flow.run_local_server(port=0)
-    # Optional: save to file if a path is configured
+
     try:
         if GOOGLE_ADS_CREDENTIALS_PATH:
             out_path = GOOGLE_ADS_CREDENTIALS_PATH
@@ -213,7 +209,6 @@ def get_oauth_credentials():
         logger.warning(f"Could not save OAuth token to file: {e}")
 
     return creds
-
 
 def get_headers(creds, *, login_customer_id: Optional[str] = None):
     """
@@ -233,9 +228,7 @@ def get_headers(creds, *, login_customer_id: Optional[str] = None):
                 try:
                     logger.info("Refreshing expired OAuth token in get_headers")
                     creds.refresh(Request())
-                    logger.info("Token successfully refreshed in get_headers")
                 except RefreshError as e:
-                    logger.error(f"Error refreshing token in get_headers: {str(e)}")
                     raise ValueError(f"Failed to refresh OAuth token: {str(e)}")
             else:
                 raise ValueError("OAuth credentials are invalid and cannot be refreshed")
@@ -247,57 +240,174 @@ def get_headers(creds, *, login_customer_id: Optional[str] = None):
         'content-type': 'application/json'
     }
 
-    # Prefer per-call override, else env
     login_id = normalize_login_customer_id(login_customer_id) or normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
     if login_id:
         headers['login-customer-id'] = login_id
 
     return headers
 
-# ----------------------------- TOOLS -----------------------------
-
-@mcp.tool()
-async def list_accounts() -> str:
+# ----------------------------- ACCOUNT INDEX + NAME/ID RESOLUTION -----------------------------
+def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     """
-    Lists all accessible Google Ads accounts.
+    Returns a list of dicts: {id, name, manager, status, currency}.
+    Caches for ACCOUNTS_CACHE_TTL_SECONDS to avoid rate limits.
+    """
+    if (not force) and _accounts_cache["items"] and _now_s() - _accounts_cache["at"] < ACCOUNTS_CACHE_TTL_SECONDS:
+        return _accounts_cache["items"]
+
+    creds = get_credentials()
+    headers = get_headers(creds)
+    url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
+    r = requests.get(url, headers=headers)
+    if r.status_code != 200:
+        raise RuntimeError(f"listAccessibleCustomers error [{r.status_code}]: {r.text}")
+
+    ids = [rn.split("/")[-1] for rn in r.json().get("resourceNames", [])]
+    items: List[Dict[str, Any]] = []
+
+    q = """
+        SELECT
+          customer.id,
+          customer.descriptive_name,
+          customer.manager,
+          customer.status,
+          customer.currency_code
+        FROM customer
+        LIMIT 1
+    """.strip()
+
+    for raw in ids:
+        cid = normalize_customer_id(raw)
+        u = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+        rr = requests.post(u, headers=headers, json={"query": q})
+        if rr.status_code == 200 and rr.json().get("results"):
+            c = rr.json()["results"][0].get("customer", {})
+            items.append({
+                "id": normalize_customer_id(c.get("id", cid)),
+                "name": c.get("descriptiveName", "") or "",
+                "manager": bool(c.get("manager", False)),
+                "status": c.get("status", ""),
+                "currency": c.get("currencyCode", ""),
+            })
+        else:
+            items.append({"id": cid, "name": "", "manager": None, "status": "", "currency": ""})
+
+    _accounts_cache["items"] = items
+    _accounts_cache["at"] = _now_s()
+    return items
+
+def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
+    """
+    Accepts:
+      - 10-digit ID (with/without dashes)
+      - Account name (case-insensitive, fuzzy)
+    Returns a customer ID (digits-only). If both MCC & non-MCC match,
+    returns the closest non-MCC when possible.
+    """
+    # Already an ID?
+    try:
+        return normalize_customer_id(identifier)
+    except Exception:
+        pass
+
+    accounts = get_accounts_index()
+    # Exact name match
+    for a in accounts:
+        if a["name"] and a["name"].lower() == identifier.lower():
+            if prefer_non_manager and a["manager"]:
+                siblings = [x for x in accounts if (x["name"] or "").lower() == a["name"].lower() and not x["manager"]]
+                if siblings:
+                    return siblings[0]["id"]
+            return a["id"]
+
+    # Fuzzy by name
+    names = [a["name"] for a in accounts if a["name"]]
+    if names:
+        candidates = difflib.get_close_matches(identifier, names, n=5, cutoff=0.6)
+        if candidates:
+            cand_rows = [a for a in accounts if a["name"] in candidates]
+            if prefer_non_manager:
+                for a in cand_rows:
+                    if not a["manager"]:
+                        return a["id"]
+            return cand_rows[0]["id"]
+
+    raise ValueError(f"No account found matching name or ID: {identifier!r}")
+
+# ----------------------------- TOOLS -----------------------------
+@mcp.tool()
+async def list_accounts(
+    force_refresh: bool = Field(default=False, description="Set true to refresh the accounts cache")
+) -> str:
+    """
+    Lists accessible accounts with name, ID, MCC flag, and currency.
     """
     try:
-        creds = get_credentials()
-        headers = get_headers(creds)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
-        response = requests.get(url, headers=headers)
-
-        if response.status_code != 200:
-            return f"Error accessing accounts [{response.status_code}]: {response.text}"
-
-        customers = response.json()
-        if not customers.get('resourceNames'):
+        items = get_accounts_index(force=force_refresh)
+        if not items:
             return "No accessible accounts found."
 
-        lines = ["Accessible Google Ads Accounts:", "-" * 50]
-        for resource_name in customers['resourceNames']:
-            cid = resource_name.split('/')[-1]
-            lines.append(f"Account ID: {normalize_customer_id(cid)}")
+        lines = ["Accessible Google Ads Accounts:", "-" * 70]
+        items_sorted = sorted(items, key=lambda x: (x["manager"] is True, (x["name"] or "").lower(), x["id"]))
+        for a in items_sorted:
+            tag = "MCC" if a["manager"] else "Client"
+            nm = a["name"] or "(no name)"
+            cur = f" · {a['currency']}" if a.get("currency") else ""
+            lines.append(f"{nm} — {a['id']} [{tag}]{cur}")
         return "\n".join(lines)
-
     except Exception as e:
         return f"Error listing accounts: {str(e)}"
 
 @mcp.tool()
+async def find_account(
+    query: str = Field(description="Account name (partial) or ID"),
+    top_k: int = Field(default=5, ge=1, le=20, description="Max results to return")
+) -> str:
+    """
+    Fuzzy-search accounts by name or normalize an ID.
+    """
+    try:
+        # If it's an ID, show the matching row
+        rows = []
+        try:
+            cid = normalize_customer_id(query)
+            rows = [a for a in get_accounts_index() if a["id"] == cid]
+        except Exception:
+            all_rows = get_accounts_index()
+            scored = []
+            for a in all_rows:
+                nm = a["name"] or ""
+                score = difflib.SequenceMatcher(None, query.lower(), nm.lower()).ratio()
+                scored.append((score, a))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            rows = [a for _, a in scored[:top_k]]
+
+        if not rows:
+            return "No matches."
+        out = []
+        for a in rows[:top_k]:
+            tag = "MCC" if a["manager"] else "Client"
+            nm = a["name"] or "(no name)"
+            out.append(f"{nm} — {a['id']} [{tag}]")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool()
 async def execute_gaql_query(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID to use as login-customer-id override")
 ) -> str:
     """
-    Execute a custom GAQL query against the specified customer_id.
+    Execute a custom GAQL query against the specified customer (name or ID).
     """
     try:
         creds = get_credentials()
-        formatted_customer_id = normalize_customer_id(customer_id)
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id)
 
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{formatted_customer_id}/googleAds:search"
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
         payload = {"query": query}
         response = requests.post(url, headers=headers, json=payload)
 
@@ -308,9 +418,9 @@ async def execute_gaql_query(
         if not results.get('results'):
             return "No results found for the query."
 
-        # Build a simple table from the first row's structure
-        fields = []
+        # Build simple table from first row
         first = results['results'][0]
+        fields: List[str] = []
         for k, v in first.items():
             if isinstance(v, dict):
                 for sk in v:
@@ -318,7 +428,7 @@ async def execute_gaql_query(
             else:
                 fields.append(k)
 
-        lines = [f"Query Results for Account {formatted_customer_id}:", "-" * 80]
+        lines = [f"Query Results for Account {cid}:", "-" * 80]
         lines.append(" | ".join(fields))
         lines.append("-" * 80)
 
@@ -326,13 +436,12 @@ async def execute_gaql_query(
             row_vals = []
             for field in fields:
                 if "." in field:
-                    parent, child = field.split(".")
-                    val = str(row.get(parent, {}).get(child, ""))
+                    p, c = field.split(".")
+                    val = str(row.get(p, {}).get(c, ""))
                 else:
                     val = str(row.get(field, ""))
                 row_vals.append(val)
             lines.append(" | ".join(row_vals))
-
         return "\n".join(lines)
 
     except Exception as e:
@@ -340,11 +449,10 @@ async def execute_gaql_query(
 
 @mcp.tool()
 async def get_campaign_performance(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 90, etc.)"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
-    # GAQL supports LAST_7_DAYS, LAST_14_DAYS, LAST_30_DAYS, LAST_90_DAYS, etc.
     if days in (7, 14, 30, 60, 90, 180):
         date_range = f"LAST_{days}_DAYS"
     else:
@@ -369,8 +477,8 @@ async def get_campaign_performance(
 
 @mcp.tool()
 async def get_ad_performance(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 90, etc.)"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     if days in (7, 14, 30, 60, 90, 180):
@@ -398,19 +506,18 @@ async def get_ad_performance(
 
 @mcp.tool()
 async def run_gaql(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
     format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     try:
         creds = get_credentials()
-        cid = normalize_customer_id(customer_id)
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id)
 
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-        payload = {"query": query}
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json={"query": query})
 
         if response.status_code != 200:
             return f"Error executing query [{response.status_code}]: {response.text}"
@@ -423,8 +530,8 @@ async def run_gaql(
             return json.dumps(results, indent=2)
 
         # Build fields
-        fields = []
         first = results['results'][0]
+        fields: List[str] = []
         for k, v in first.items():
             if isinstance(v, dict):
                 for sk in v:
@@ -446,9 +553,8 @@ async def run_gaql(
                 csv_lines.append(",".join(row_vals))
             return "\n".join(csv_lines)
 
-        # Default: table
+        # Default: table with widths
         lines = [f"Query Results for Account {cid}:", "-" * 100]
-        # widths
         widths = {f: len(f) for f in fields}
         for row in results['results']:
             for f in fields:
@@ -479,7 +585,7 @@ async def run_gaql(
 
 @mcp.tool()
 async def get_ad_creatives(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     query = """
@@ -501,7 +607,7 @@ async def get_ad_creatives(
     try:
         creds = get_credentials()
         headers = get_headers(creds, login_customer_id=login_customer_id)
-        cid = normalize_customer_id(customer_id)
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
         response = requests.post(url, headers=headers, json={"query": query})
 
@@ -510,9 +616,9 @@ async def get_ad_creatives(
 
         results = response.json()
         if not results.get('results'):
-            return "No ad creatives found for this customer ID."
+            return "No ad creatives found for this customer."
 
-        out = [f"Ad Creatives for Customer ID {cid}:", "=" * 80]
+        out = [f"Ad Creatives for Customer {cid}:", "=" * 80]
         for i, res in enumerate(results['results'], 1):
             ad = res.get('adGroupAd', {}).get('ad', {})
             ad_group = res.get('adGroup', {})
@@ -548,7 +654,7 @@ async def get_ad_creatives(
 
 @mcp.tool()
 async def get_account_currency(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     query = """
@@ -561,15 +667,13 @@ async def get_account_currency(
     try:
         creds = get_credentials()
         if not creds.valid:
-            logger.info("Credentials not valid, attempting refresh...")
             if getattr(creds, 'refresh_token', None):
                 creds.refresh(Request())
-                logger.info("Credentials refreshed successfully")
             else:
                 raise ValueError("Invalid credentials and no refresh token available")
 
         headers = get_headers(creds, login_customer_id=login_customer_id)
-        cid = normalize_customer_id(customer_id)
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
         response = requests.post(url, headers=headers, json={"query": query})
@@ -578,7 +682,7 @@ async def get_account_currency(
 
         results = response.json()
         if not results.get('results'):
-            return "No account information found for this customer ID."
+            return "No account information found for this customer."
 
         customer = results['results'][0].get('customer', {})
         currency_code = customer.get('currencyCode', 'Not specified')
@@ -588,32 +692,9 @@ async def get_account_currency(
         logger.error(f"Error retrieving account currency: {str(e)}")
         return f"Error retrieving account currency: {str(e)}"
 
-@mcp.resource("gaql://reference")
-def gaql_reference() -> str:
-    return """
-    # Google Ads Query Language (GAQL) Reference
-    (shortened for brevity)
-    """
-
-@mcp.prompt("google_ads_workflow")
-def google_ads_workflow() -> str:
-    return """
-    1) list_accounts()
-    2) get_account_currency(customer_id="...")
-    3) get_campaign_performance / get_ad_performance / get_ad_creatives
-    4) run_gaql(customer_id="...", query="...")
-    """
-
-@mcp.prompt("gaql_help")
-def gaql_help() -> str:
-    return """
-    Examples:
-    SELECT campaign.name, metrics.clicks FROM campaign WHERE segments.date DURING LAST_30_DAYS LIMIT 10
-    """
-
 @mcp.tool()
-async def get_image_assets(  # <-- keep signature identical, add optional MCC override
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
+async def get_image_assets(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     limit: int = Field(default=50, description="Maximum number of image assets to return"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
@@ -633,7 +714,7 @@ async def get_image_assets(  # <-- keep signature identical, add optional MCC ov
     try:
         creds = get_credentials()
         headers = get_headers(creds, login_customer_id=login_customer_id)
-        cid = normalize_customer_id(customer_id)
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
         response = requests.post(url, headers=headers, json={"query": query})
@@ -642,9 +723,9 @@ async def get_image_assets(  # <-- keep signature identical, add optional MCC ov
 
         results = response.json()
         if not results.get('results'):
-            return "No image assets found for this customer ID."
+            return "No image assets found for this customer."
 
-        out = [f"Image Assets for Customer ID {cid}:", "=" * 80]
+        out = [f"Image Assets for Customer {cid}:", "=" * 80]
         for i, res in enumerate(results['results'], 1):
             asset = res.get('asset', {})
             img = asset.get('imageAsset', {})
@@ -666,7 +747,7 @@ async def get_image_assets(  # <-- keep signature identical, add optional MCC ov
 
 @mcp.tool()
 async def download_image_asset(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     asset_id: str = Field(description="The ID of the image asset to download"),
     output_dir: str = Field(default="./ad_images", description="Directory to save the downloaded image"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
@@ -684,7 +765,7 @@ async def download_image_asset(
     try:
         creds = get_credentials()
         headers = get_headers(creds, login_customer_id=login_customer_id)
-        cid = normalize_customer_id(customer_id)
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
         resp = requests.post(url, headers=headers, json={"query": query})
@@ -720,8 +801,8 @@ async def download_image_asset(
 
 @mcp.tool()
 async def get_asset_usage(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
-    asset_id: str = Field(default=None, description="Optional: specific asset ID to look up (leave empty to get all image assets)"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    asset_id: str = Field(default=None, description="Optional: specific asset ID to look up"),
     asset_type: str = Field(default="IMAGE", description="Asset type to search for ('IMAGE', 'TEXT', 'VIDEO', etc.)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
@@ -743,17 +824,10 @@ async def get_asset_usage(
         LIMIT 500
     """
 
-    ad_group_query = f"""
-        SELECT ad_group.id, ad_group.name, asset.id, asset.name, asset.type
-        FROM ad_group_asset
-        WHERE {where_clause}
-        LIMIT 500
-    """
-
     try:
         creds = get_credentials()
         headers = get_headers(creds, login_customer_id=login_customer_id)
-        cid = normalize_customer_id(customer_id)
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
         assets_resp = requests.post(url, headers=headers, json={"query": assets_query})
@@ -761,14 +835,14 @@ async def get_asset_usage(
             return f"Error retrieving assets [{assets_resp.status_code}]: {assets_resp.text}"
         assets_results = assets_resp.json()
         if not assets_results.get('results'):
-            return f"No {asset_type} assets found for this customer ID."
+            return f"No {asset_type} assets found for this customer."
 
         assoc_resp = requests.post(url, headers=headers, json={"query": associations_query})
         if assoc_resp.status_code != 200:
             return f"Error retrieving asset associations [{assoc_resp.status_code}]: {assoc_resp.text}"
         assoc_results = assoc_resp.json()
 
-        out = [f"Asset Usage for Customer ID {cid}:", "=" * 80]
+        out = [f"Asset Usage for Customer {cid}:", "=" * 80]
         asset_usage: Dict[str, Dict[str, Any]] = {}
 
         for r in assets_results.get('results', []):
@@ -811,7 +885,7 @@ async def get_asset_usage(
 
 @mcp.tool()
 async def analyze_image_assets(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
@@ -841,7 +915,7 @@ async def analyze_image_assets(
     try:
         creds = get_credentials()
         headers = get_headers(creds, login_customer_id=login_customer_id)
-        cid = normalize_customer_id(customer_id)
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
         resp = requests.post(url, headers=headers, json={"query": query})
@@ -850,7 +924,7 @@ async def analyze_image_assets(
 
         results = resp.json()
         if not results.get('results'):
-            return "No image asset performance data found for this customer ID and time period."
+            return "No image asset performance data found for this customer and time period."
 
         assets_data: Dict[str, Dict[str, Any]] = {}
         for r in results.get('results', []):
@@ -877,7 +951,7 @@ async def analyze_image_assets(
             if c.get('name'):
                 assets_data[aid]['campaigns'].add(c.get('name'))
 
-        out = [f"Image Asset Performance Analysis for Customer ID {cid} ({date_range.replace('_', ' ').title()}):",
+        out = [f"Image Asset Performance Analysis for Customer {cid} ({date_range.replace('_', ' ').title()}):",
                "=" * 100]
 
         sorted_assets = sorted(assets_data.items(), key=lambda x: x[1]['impressions'], reverse=True)
@@ -908,7 +982,7 @@ async def analyze_image_assets(
 
 @mcp.tool()
 async def list_resources(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     query = """
@@ -922,24 +996,44 @@ async def list_resources(
     """
     return await run_gaql(customer_id, query, "table", login_customer_id)
 
-# --- HTTP app for Render (use uvicorn to serve) ---
-# Configure the path where the MCP endpoint will live (default /mcp)
-MCP_HTTP_PATH = os.getenv("MCP_HTTP_PATH", "/mcp")
+# ----------------------------- MCP RESOURCES & PROMPTS -----------------------------
+@mcp.resource("gaql://reference")
+def gaql_reference() -> str:
+    return """
+    # Google Ads Query Language (GAQL) Reference (short)
+    SELECT field1, field2 FROM resource WHERE condition ORDER BY field LIMIT n
+    Common resources: campaign, ad_group, ad_group_ad, asset, customer, keyword_view, etc.
+    Date ranges: LAST_7_DAYS, LAST_14_DAYS, LAST_30_DAYS, LAST_90_DAYS, ...
+    """
 
-# If you want the path applied at init-time, you can set it here, e.g.:
-#   mcp = FastMCP("google-ads-server", streamable_http_path=MCP_HTTP_PATH)
-# If your FastMCP was already created above, set it like this:
+@mcp.prompt("google_ads_workflow")
+def google_ads_workflow() -> str:
+    return """
+    1) list_accounts()
+    2) get_account_currency(customer_id="name or ID")
+    3) get_campaign_performance / get_ad_performance / get_ad_creatives
+    4) run_gaql(customer_id="name or ID", query="...")
+    """
+
+@mcp.prompt("gaql_help")
+def gaql_help() -> str:
+    return """
+    Examples:
+    SELECT campaign.name, metrics.clicks FROM campaign WHERE segments.date DURING LAST_30_DAYS LIMIT 10
+    """
+
+# ----------------------------- HTTP (ASGI) APP FOR RENDER -----------------------------
+MCP_HTTP_PATH = os.getenv("MCP_HTTP_PATH", "/mcp")
 try:
-    # Works on recent FastMCP versions
+    # On newer fastmcp versions
     mcp.settings.streamable_http_path = MCP_HTTP_PATH  # type: ignore[attr-defined]
 except Exception:
     pass
 
-# Expose an ASGI app that uvicorn can serve
 app = mcp.streamable_http_app()
 
 if __name__ == "__main__":
-    # Local dev convenience: run with uvicorn if you launch the file directly
+    # Local dev convenience (Render should run uvicorn externally)
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("google_ads_server:app", host="0.0.0.0", port=port, reload=False)
