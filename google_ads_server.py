@@ -298,41 +298,79 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
 
 def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
     """
-    Accepts:
-      - 10-digit ID (with/without dashes)
-      - Account name (case-insensitive, fuzzy)
-    Returns a customer ID (digits-only). If both MCC & non-MCC match,
-    returns the closest non-MCC when possible.
+    Accepts ID (with/without dashes) or account name (approximate).
+    Returns 10-digit customer ID. Prefers non-MCC accounts on ties.
+    Matching order:
+      1) Already-an-ID → normalize & return
+      2) Exact name (case-insensitive)
+      3) Substring name match (case-insensitive)
+      4) Fuzzy name match with low cutoff (0.3)
+      5) Best SequenceMatcher score (no cutoff)
     """
-    # Already an ID?
+    # 1) Already looks like an ID?
     try:
         return normalize_customer_id(identifier)
     except Exception:
         pass
 
-    accounts = get_accounts_index()
-    # Exact name match
-    for a in accounts:
-        if a["name"] and a["name"].lower() == identifier.lower():
-            if prefer_non_manager and a["manager"]:
-                siblings = [x for x in accounts if (x["name"] or "").lower() == a["name"].lower() and not x["manager"]]
-                if siblings:
-                    return siblings[0]["id"]
-            return a["id"]
+    q = (identifier or "").strip().lower()
+    if not q:
+        raise ValueError("Empty account identifier.")
 
-    # Fuzzy by name
-    names = [a["name"] for a in accounts if a["name"]]
-    if names:
-        candidates = difflib.get_close_matches(identifier, names, n=5, cutoff=0.6)
+    accounts = get_accounts_index()
+
+    # 2) Exact name match
+    exact = [a for a in accounts if (a.get("name") or "").lower() == q]
+    if exact:
+        if prefer_non_manager:
+            for a in exact:
+                if not a.get("manager"):
+                    return a["id"]
+        return exact[0]["id"]
+
+    # 3) Substring match
+    contains = [a for a in accounts if q in (a.get("name") or "").lower()]
+    if contains:
+        if prefer_non_manager:
+            for a in contains:
+                if not a.get("manager"):
+                    return a["id"]
+        return contains[0]["id"]
+
+    # 4) Fuzzy (lower cutoff)
+    names = [a["name"] for a in accounts if a.get("name")]
+    try:
+        import difflib
+        candidates = difflib.get_close_matches(identifier, names, n=5, cutoff=0.3)
         if candidates:
-            cand_rows = [a for a in accounts if a["name"] in candidates]
+            cand_rows = [a for a in accounts if a.get("name") in candidates]
             if prefer_non_manager:
                 for a in cand_rows:
-                    if not a["manager"]:
+                    if not a.get("manager"):
                         return a["id"]
             return cand_rows[0]["id"]
+    except Exception:
+        pass
+
+    # 5) Best score, no cutoff
+    try:
+        import difflib
+        best_row = None
+        best_score = -1.0
+        for a in accounts:
+            nm = a.get("name") or ""
+            score = difflib.SequenceMatcher(None, q, nm.lower()).ratio()
+            # prefer non-MCC if scores are equal within a tiny epsilon
+            if (score > best_score) or (abs(score - best_score) < 1e-9 and best_row and best_row.get("manager") and not a.get("manager")):
+                best_score = score
+                best_row = a
+        if best_row:
+            return best_row["id"]
+    except Exception:
+        pass
 
     raise ValueError(f"No account found matching name or ID: {identifier!r}")
+
 
 # ----------------------------- TOOLS -----------------------------
 @mcp.tool()
@@ -995,6 +1033,19 @@ async def list_resources(
         ORDER BY google_ads_field.name
     """
     return await run_gaql(customer_id, query, "table", login_customer_id)
+
+
+@mcp.tool()
+async def debug_accounts_index() -> str:
+    items = get_accounts_index(force=False)
+    if not items:
+        return "No accounts."
+    lines = ["Accounts cache:", "-"*60]
+    for a in items:
+        tag = "MCC" if a.get("manager") else "Client"
+        nm = a.get("name") or "(no name)"
+        lines.append(f"{nm} — {a['id']} [{tag}]")
+    return "\n".join(lines)
 
 # ----------------------------- MCP RESOURCES & PROMPTS -----------------------------
 @mcp.resource("gaql://reference")
