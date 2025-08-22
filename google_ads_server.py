@@ -587,7 +587,7 @@ def gaql_help() -> str:
     SELECT campaign.name, metrics.clicks FROM campaign WHERE segments.date DURING LAST_30_DAYS LIMIT 10
     """
 
-@mcp.tool())
+@mcp.tool()
 async def get_image_assets(  # <-- keep signature identical, add optional MCC override
     customer_id: str = Field(description="Google Ads customer ID (10 digits, no dashes). Example: '9873186703'"),
     limit: int = Field(default=50, description="Maximum number of image assets to return"),
