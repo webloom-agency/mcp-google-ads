@@ -710,22 +710,19 @@ async def execute_gaql_query(
 ) -> str:
     """
     Execute a custom GAQL query against the specified customer (name or ID).
+    Fetches all pages (no artificial caps; only API limitations apply).
     """
     try:
         creds = get_credentials()
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id)
 
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-        response = requests.post(url, headers=headers, json={"query": query})
-        if response.status_code != 200:
-            return f"Error executing query [{response.status_code}]: {response.text}"
-
-        results = response.json()
-        if not results.get('results'):
+        # Fetch all rows via pagination helper (no page size parameter sent)
+        rows = _gaql_search_all(cid, query, headers)
+        if not rows:
             return "No results found for the query."
 
-        first = results['results'][0]
+        first = rows[0]
         fields: List[str] = []
         for k, v in first.items():
             if isinstance(v, dict):
@@ -737,7 +734,7 @@ async def execute_gaql_query(
         lines = [f"Query Results for Account {cid}:", "-" * 80]
         lines.append(" | ".join(fields))
         lines.append("-" * 80)
-        for row in results['results']:
+        for row in rows:
             row_vals = []
             for field in fields:
                 if "." in field:
@@ -776,7 +773,6 @@ async def get_campaign_performance(
         FROM campaign
         WHERE segments.date DURING {date_range}
         ORDER BY metrics.cost_micros DESC
-        LIMIT 50
     """
     return await execute_gaql_query(customer_id, query, login_customer_id)
 
@@ -805,7 +801,6 @@ async def get_ad_performance(
         FROM ad_group_ad
         WHERE segments.date DURING {date_range}
         ORDER BY metrics.impressions DESC
-        LIMIT 50
     """
     return await execute_gaql_query(customer_id, query, login_customer_id)
 
@@ -820,19 +815,16 @@ async def run_gaql(
         creds = get_credentials()
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-        response = requests.post(url, headers=headers, json={"query": query})
-        if response.status_code != 200:
-            return f"Error executing query [{response.status_code}]: {response.text}"
 
-        results = response.json()
-        if not results.get('results'):
+        # Fetch all rows with pagination (no artificial caps)
+        rows = _gaql_search_all(cid, query, headers)
+        if not rows:
             return "No results found for the query."
 
         if format.lower() == "json":
-            return json.dumps(results, indent=2)
+            return json.dumps({"results": rows}, indent=2)
 
-        first = results['results'][0]
+        first = rows[0]
         fields: List[str] = []
         for k, v in first.items():
             if isinstance(v, dict):
@@ -843,7 +835,7 @@ async def run_gaql(
 
         if format.lower() == "csv":
             csv_lines = [",".join(fields)]
-            for row in results['results']:
+            for row in rows:
                 row_vals = []
                 for f in fields:
                     if "." in f:
@@ -858,7 +850,7 @@ async def run_gaql(
         # table
         lines = [f"Query Results for Account {cid}:", "-" * 100]
         widths = {f: len(f) for f in fields}
-        for row in results['results']:
+        for row in rows:
             for f in fields:
                 if "." in f:
                     p, c = f.split(".")
@@ -870,7 +862,7 @@ async def run_gaql(
         header = " | ".join(f"{f:{widths[f]}}" for f in fields)
         lines.append(header)
         lines.append("-" * len(header))
-        for row in results['results']:
+        for row in rows:
             vals = []
             for f in fields:
                 if "." in f:
@@ -904,23 +896,18 @@ async def get_ad_creatives(
         FROM ad_group_ad
         WHERE ad_group_ad.status != 'REMOVED'
         ORDER BY campaign.name, ad_group.name
-        LIMIT 50
     """
     try:
         creds = get_credentials()
         headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
-        response = requests.post(url, headers=headers, json={"query": query})
-        if response.status_code != 200:
-            return f"Error retrieving ad creatives [{response.status_code}]: {response.text}"
 
-        results = response.json()
-        if not results.get('results'):
+        rows = _gaql_search_all(cid, query, headers)
+        if not rows:
             return "No ad creatives found for this customer."
 
         out = [f"Ad Creatives for Customer {cid}:", "=" * 80]
-        for i, res in enumerate(results['results'], 1):
+        for i, res in enumerate(rows, 1):
             ad = res.get('adGroupAd', {}).get('ad', {})
             ad_group = res.get('adGroup', {})
             campaign = res.get('campaign', {})
@@ -996,7 +983,7 @@ async def get_account_currency(
 @mcp.tool()
 async def get_image_assets(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    limit: int = Field(default=50, description="Maximum number of image assets to return"),
+    limit: int = Field(default=0, description="Maximum number of image assets to return (0 = no limit)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     query = f"""
@@ -1010,7 +997,7 @@ async def get_image_assets(
             asset.image_asset.file_size
         FROM asset
         WHERE asset.type = 'IMAGE'
-        LIMIT {limit}
+        {f"LIMIT {limit}" if isinstance(limit, int) and limit > 0 else ''}
     """
     try:
         creds = get_credentials()
@@ -1018,16 +1005,22 @@ async def get_image_assets(
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
-        response = requests.post(url, headers=headers, json={"query": query})
-        if response.status_code != 200:
-            return f"Error retrieving image assets [{response.status_code}]: {response.text}"
+        # If limit > 0, rely on server-side LIMIT; else fetch all pages
+        if isinstance(limit, int) and limit > 0:
+            response = requests.post(url, headers=headers, json={"query": query})
+            if response.status_code != 200:
+                return f"Error retrieving image assets [{response.status_code}]: {response.text}"
+            rows = response.json().get('results', [])
+        else:
+            # Remove any trailing whitespace-only LIMIT fragment before sending
+            q_no_limit = "\n".join([ln for ln in query.splitlines() if not ln.strip().startswith("LIMIT ")])
+            rows = _gaql_search_all(cid, q_no_limit, headers)
 
-        results = response.json()
-        if not results.get('results'):
+        if not rows:
             return "No image assets found for this customer."
 
         out = [f"Image Assets for Customer {cid}:", "=" * 80]
-        for i, res in enumerate(results['results'], 1):
+        for i, res in enumerate(rows, 1):
             asset = res.get('asset', {})
             img = asset.get('imageAsset', {})
             full = img.get('fullSize', {})
@@ -1115,38 +1108,29 @@ async def get_asset_usage(
         SELECT asset.id, asset.name, asset.type
         FROM asset
         WHERE {where_clause}
-        LIMIT 100
     """
 
     associations_query = f"""
         SELECT campaign.id, campaign.name, asset.id, asset.name, asset.type
         FROM campaign_asset
         WHERE {where_clause}
-        LIMIT 500
     """
 
     try:
         creds = get_credentials()
         headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
-        assets_resp = requests.post(url, headers=headers, json={"query": assets_query})
-        if assets_resp.status_code != 200:
-            return f"Error retrieving assets [{assets_resp.status_code}]: {assets_resp.text}"
-        assets_results = assets_resp.json()
-        if not assets_results.get('results'):
+        assets_rows = _gaql_search_all(cid, assets_query, headers)
+        if not assets_rows:
             return f"No {asset_type} assets found for this customer."
 
-        assoc_resp = requests.post(url, headers=headers, json={"query": associations_query})
-        if assoc_resp.status_code != 200:
-            return f"Error retrieving asset associations [{assoc_resp.status_code}]: {assoc_resp.text}"
-        assoc_results = assoc_resp.json()
+        assoc_rows = _gaql_search_all(cid, associations_query, headers)
 
         out = [f"Asset Usage for Customer {cid}:", "=" * 80]
         asset_usage: Dict[str, Dict[str, Any]] = {}
 
-        for r in assets_results.get('results', []):
+        for r in assets_rows:
             a = r.get('asset', {})
             aid = a.get('id')
             if aid:
@@ -1156,7 +1140,7 @@ async def get_asset_usage(
                     "usage": []
                 }
 
-        for r in assoc_results.get('results', []):
+        for r in assoc_rows:
             a = r.get('asset', {})
             aid = a.get('id')
             if aid and aid in asset_usage:
@@ -1211,24 +1195,18 @@ async def analyze_image_assets(
         WHERE asset.type = 'IMAGE'
           AND segments.date DURING {date_range}
         ORDER BY metrics.impressions DESC
-        LIMIT 200
     """
     try:
         creds = get_credentials()
         headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
-        resp = requests.post(url, headers=headers, json={"query": query})
-        if resp.status_code != 200:
-            return f"Error analyzing image assets [{resp.status_code}]: {resp.text}"
-
-        results = resp.json()
-        if not results.get('results'):
+        rows = _gaql_search_all(cid, query, headers)
+        if not rows:
             return "No image asset performance data found for this customer and time period."
 
         assets_data: Dict[str, Dict[str, Any]] = {}
-        for r in results.get('results', []):
+        for r in rows:
             a = r.get('asset', {})
             aid = a.get('id')
             if aid not in assets_data:
