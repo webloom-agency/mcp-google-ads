@@ -366,6 +366,9 @@ The Google Ads MCP now supports environment file configuration for easier setup.
    
    # Optional: Manager Account ID (if applicable)
    GOOGLE_ADS_LOGIN_CUSTOMER_ID=your_manager_account_id
+
+   # Enforce read-only mode (blocks non-read Google Ads endpoints)
+   GOOGLE_ADS_READ_ONLY=1
    ```
 
 4. Save the file.
@@ -388,7 +391,8 @@ You can also set environment variables directly in your system or in the configu
         "GOOGLE_ADS_AUTH_TYPE": "oauth",
         "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/credentials.json",
         "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
-        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE",
+        "GOOGLE_ADS_READ_ONLY": "1"
       }
     }
   }
@@ -439,7 +443,8 @@ Add the following text (this tells Claude how to connect to Google Ads):
       "env": {
         "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
         "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
-        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
+        "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE",
+        "GOOGLE_ADS_READ_ONLY": "1"
       }
     }
   }
@@ -498,7 +503,8 @@ Cursor is an AI-powered code editor that can be enhanced with MCP tools. You can
          "env": {
            "GOOGLE_ADS_CREDENTIALS_PATH": "/FULL/PATH/TO/mcp-google-ads-main/service_account_credentials.json",
            "GOOGLE_ADS_DEVELOPER_TOKEN": "YOUR_DEVELOPER_TOKEN_HERE",
-           "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE"
+          "GOOGLE_ADS_LOGIN_CUSTOMER_ID": "YOUR_MANAGER_ACCOUNT_ID_HERE",
+          "GOOGLE_ADS_READ_ONLY": "1"
          }
        }
      }

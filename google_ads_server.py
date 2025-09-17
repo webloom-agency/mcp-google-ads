@@ -53,6 +53,7 @@ GOOGLE_ADS_DEVELOPER_TOKEN = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
 GOOGLE_ADS_LOGIN_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")
 GOOGLE_ADS_AUTH_TYPE = os.environ.get("GOOGLE_ADS_AUTH_TYPE", "oauth")  # 'oauth' or 'service_account'
 DEFAULT_GOOGLE_ADS_CUSTOMER_ID = os.environ.get("DEFAULT_GOOGLE_ADS_CUSTOMER_ID")  # optional default
+GOOGLE_ADS_READ_ONLY = os.environ.get("GOOGLE_ADS_READ_ONLY", "1") not in ("0", "false", "False")
 
 # Caches
 ACCOUNTS_CACHE_TTL_SECONDS = int(os.getenv("ACCOUNTS_CACHE_TTL_SECONDS", "900"))
@@ -67,6 +68,43 @@ _hierarchy_cache: Dict[str, Any] = {"at": 0, "items": []}    # customer_client-b
 # ----------------------------- HELPERS -----------------------------
 def _now_s() -> int:
     return int(time.time())
+
+def _is_google_ads_api_url(url: str) -> bool:
+    try:
+        return "googleads.googleapis.com" in str(url)
+    except Exception:
+        return False
+
+def _is_readonly_allowed(url: str, method: str) -> bool:
+    """
+    Whitelist Google Ads API endpoints that are considered read-only.
+    Currently allowed:
+      - POST .../customers/{cid}/googleAds:search (GAQL search)
+      - GET  .../customers:listAccessibleCustomers
+    """
+    if not _is_google_ads_api_url(url):
+        return True
+    method_u = (method or "").upper()
+    try:
+        path = str(url).split("googleads.googleapis.com/", 1)[-1]
+    except Exception:
+        path = str(url)
+
+    if method_u == "POST" and path.endswith("/googleAds:search"):
+        return True
+    if method_u == "GET" and path.endswith("/customers:listAccessibleCustomers"):
+        return True
+    return False
+
+def _google_ads_request(method: str, url: str, headers: Dict[str, str], *, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None):
+    """
+    Centralized HTTP wrapper for Google Ads API calls.
+    Enforces read-only mode by blocking non-whitelisted endpoints/methods.
+    """
+    if GOOGLE_ADS_READ_ONLY and _is_google_ads_api_url(url):
+        if not _is_readonly_allowed(url, method):
+            raise PermissionError("Write operations are disabled (GOOGLE_ADS_READ_ONLY=1).")
+    return requests.request(method, url, headers=headers, json=json, params=params)
 
 def normalize_customer_id(value: Optional[str]) -> str:
     """
@@ -270,7 +308,7 @@ def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict
         if page_token:
             payload["pageToken"] = page_token
 
-        r = requests.post(url, headers=headers, json=payload)
+        r = _google_ads_request("POST", url, headers, json=payload)
         if r.status_code != 200:
             raise RuntimeError(f"GAQL search error [{r.status_code}]: {r.text}")
 
@@ -365,7 +403,7 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     creds_root = get_credentials()
     headers_root = get_headers(creds_root)
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
-    r = requests.get(url, headers=headers_root)
+    r = _google_ads_request("GET", url, headers_root)
     if r.status_code != 200:
         raise RuntimeError(f"listAccessibleCustomers error [{r.status_code}]: {r.text}")
 
@@ -390,7 +428,7 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
         # Attempt 1: login_customer_id = cid
         try:
             headers_1 = get_headers(get_credentials(), login_customer_id=cid)
-            rr = requests.post(u, headers=headers_1, json={"query": q})
+            rr = _google_ads_request("POST", u, headers_1, json={"query": q})
         except Exception:
             rr = None
 
@@ -398,7 +436,7 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
         if not rr or rr.status_code != 200 or not rr.json().get("results"):
             try:
                 headers_2 = get_headers(get_credentials())  # uses env MCC
-                rr2 = requests.post(u, headers=headers_2, json={"query": q})
+                rr2 = _google_ads_request("POST", u, headers_2, json={"query": q})
             except Exception:
                 rr2 = None
         else:
@@ -964,7 +1002,7 @@ async def get_account_currency(
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
-        response = requests.post(url, headers=headers, json={"query": query})
+        response = _google_ads_request("POST", url, headers, json={"query": query})
         if response.status_code != 200:
             return f"Error retrieving account currency [{response.status_code}]: {response.text}"
 
@@ -1007,7 +1045,7 @@ async def get_image_assets(
 
         # If limit > 0, rely on server-side LIMIT; else fetch all pages
         if isinstance(limit, int) and limit > 0:
-            response = requests.post(url, headers=headers, json={"query": query})
+            response = _google_ads_request("POST", url, headers, json={"query": query})
             if response.status_code != 200:
                 return f"Error retrieving image assets [{response.status_code}]: {response.text}"
             rows = response.json().get('results', [])
@@ -1062,7 +1100,7 @@ async def download_image_asset(
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
 
-        resp = requests.post(url, headers=headers, json={"query": query})
+        resp = _google_ads_request("POST", url, headers, json={"query": query})
         if resp.status_code != 200:
             return f"Error retrieving image asset [{resp.status_code}]: {resp.text}"
 
