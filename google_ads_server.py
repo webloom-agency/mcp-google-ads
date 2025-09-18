@@ -7,6 +7,7 @@ import re
 import time
 import difflib
 import logging
+from urllib.parse import urlparse
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
@@ -507,35 +508,88 @@ def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
     except Exception:
         pass
 
+    def _extract_name_candidates(text: str) -> List[str]:
+        raw = (text or "").strip().lower()
+        out: List[str] = []
+
+        # Primary candidate: the raw input lowered
+        if raw:
+            out.append(raw)
+
+        # Try URL parsing to extract hostname
+        try:
+            parsed = urlparse(raw if re.match(r"^[a-z]+://", raw) else f"http://{raw}")
+            host = (parsed.hostname or "").lower()
+        except Exception:
+            host = ""
+
+        # If not parsed, try regex domain extraction
+        if not host:
+            m = re.search(r"([a-z0-9][a-z0-9-]*\.)+[a-z]{2,}", raw)
+            if m:
+                host = m.group(0)
+
+        if host:
+            out.append(host)
+            # Drop www.
+            if host.startswith("www."):
+                out.append(host[4:])
+            # Base label (left-most without www)
+            base = host.split(".")[0]
+            if base == "www" and len(host.split(".")) > 1:
+                base = host.split(".")[1]
+            if base:
+                out.append(base)
+                # Split hyphen/underscore variants
+                for token in re.split(r"[-_]+", base):
+                    if token and token not in out:
+                        out.append(token)
+
+        # De-duplicate while preserving order
+        seen = set()
+        uniq: List[str] = []
+        for s in out:
+            if s not in seen:
+                uniq.append(s)
+                seen.add(s)
+        return uniq
+
     q = (identifier or "").strip().lower()
     if not q:
         raise ValueError("Empty account identifier.")
 
     accounts = _active_index(force=False)
+    candidates = _extract_name_candidates(q)
 
     # 2) Exact name match
-    exact = [a for a in accounts if (a.get("name") or "").lower() == q]
-    if exact:
-        if prefer_non_manager:
-            for a in exact:
-                if not a.get("manager"):
-                    return a["id"]
-        return exact[0]["id"]
+    for cand in candidates:
+        exact = [a for a in accounts if (a.get("name") or "").lower() == cand]
+        if exact:
+            if prefer_non_manager:
+                for a in exact:
+                    if not a.get("manager"):
+                        return a["id"]
+            return exact[0]["id"]
 
     # 3) Substring match
-    contains = [a for a in accounts if q in (a.get("name") or "").lower()]
-    if contains:
-        if prefer_non_manager:
-            for a in contains:
-                if not a.get("manager"):
-                    return a["id"]
-        return contains[0]["id"]
+    for cand in candidates:
+        contains = [a for a in accounts if cand in (a.get("name") or "").lower()]
+        if contains:
+            if prefer_non_manager:
+                for a in contains:
+                    if not a.get("manager"):
+                        return a["id"]
+            return contains[0]["id"]
 
     # 4) Fuzzy (lower cutoff)
     names = [a["name"] for a in accounts if a.get("name")]
-    candidates = difflib.get_close_matches(identifier, names, n=5, cutoff=0.3)
-    if candidates:
-        cand_rows = [a for a in accounts if a.get("name") in candidates]
+    close_any: List[str] = []
+    for cand in candidates:
+        for hit in difflib.get_close_matches(cand, names, n=5, cutoff=0.3):
+            if hit not in close_any:
+                close_any.append(hit)
+    if close_any:
+        cand_rows = [a for a in accounts if a.get("name") in close_any]
         if prefer_non_manager:
             for a in cand_rows:
                 if not a.get("manager"):
@@ -547,7 +601,10 @@ def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
     best_score = -1.0
     for a in accounts:
         nm = a.get("name") or ""
-        score = difflib.SequenceMatcher(None, q, nm.lower()).ratio()
+        # Consider the best score among all candidate tokens
+        score = 0.0
+        for cand in candidates:
+            score = max(score, difflib.SequenceMatcher(None, cand, nm.lower()).ratio())
         if (score > best_score) or (abs(score - best_score) < 1e-9 and best_row and best_row.get("manager") and not a.get("manager")):
             best_score = score
             best_row = a
