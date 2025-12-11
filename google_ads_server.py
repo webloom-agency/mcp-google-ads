@@ -25,9 +25,15 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('google_ads_server')
 
+logger.info("=" * 80)
+logger.info("🚀 Google Ads MCP Server starting up...")
+logger.info("=" * 80)
+
 # Monkey-patch transport_security BEFORE any FastMCP initialization
+logger.info("🔧 Attempting to patch transport_security module...")
 try:
     from mcp.server import transport_security
+    from mcp.server import streamable_http_manager
     
     # Patch the TransportSecurity class itself
     if hasattr(transport_security, 'TransportSecurity'):
@@ -40,19 +46,21 @@ try:
                 return True
             
             def __init__(self, *args, **kwargs):
-                # Force allowed_hosts to None
+                # Force allowed_hosts to None to disable validation
                 if 'allowed_hosts' in kwargs:
-                    kwargs['allowed_hosts'] = None
+                    del kwargs['allowed_hosts']
                 super().__init__(*args, **kwargs)
+                # Override after init
                 self.allowed_hosts = None
+                self._allowed_hosts = None
         
         transport_security.TransportSecurity = PatchedTransportSecurity
         logger.info("✓ Patched TransportSecurity class to bypass Host validation")
     
-    # Also try to patch standalone function
-    if hasattr(transport_security, 'validate_host'):
-        transport_security.validate_host = lambda host, allowed_hosts=None: True
-        logger.info("✓ Patched validate_host function")
+    # Also patch the streamable_http_manager if it imports TransportSecurity
+    if hasattr(streamable_http_manager, 'TransportSecurity'):
+        streamable_http_manager.TransportSecurity = transport_security.TransportSecurity
+        logger.info("✓ Updated TransportSecurity reference in streamable_http_manager")
         
 except Exception as e:
     logger.error(f"⚠ Could not patch transport_security: {e}")
@@ -1452,6 +1460,26 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 app = mcp.streamable_http_app()
+
+# Patch transport security AFTER app creation
+try:
+    # Access the transport manager from the app
+    if hasattr(app, 'state'):
+        # Find all TransportSecurity instances and disable validation
+        for attr_name in dir(app.state):
+            attr = getattr(app.state, attr_name, None)
+            if attr and hasattr(attr, 'validate_host'):
+                # Monkey-patch the validate_host method on the instance
+                attr.validate_host = lambda host: True
+                logger.info(f"✓ Disabled Host validation on {attr_name}")
+            if attr and hasattr(attr, '_transport_security'):
+                ts = attr._transport_security
+                if ts and hasattr(ts, 'validate_host'):
+                    ts.validate_host = lambda host: True
+                    ts.allowed_hosts = None
+                    logger.info(f"✓ Disabled Host validation on {attr_name}._transport_security")
+except Exception as e:
+    logger.warning(f"Could not patch app.state: {e}")
 
 # Add Bearer auth enforcement if MCP_BEARER_TOKEN is set
 app.add_middleware(BearerAuthMiddleware)
