@@ -1424,11 +1424,15 @@ def gaql_help() -> str:
 
 # ----------------------------- HTTP (ASGI) APP FOR RENDER -----------------------------
 MCP_HTTP_PATH = os.getenv("MCP_HTTP_PATH", "/mcp")
+
+# Configure FastMCP settings for Render deployment
 try:
     # On newer fastmcp versions
     mcp.settings.streamable_http_path = MCP_HTTP_PATH  # type: ignore[attr-defined]
-except Exception:
-    pass
+    # Allow Render hostname to pass Host header validation
+    mcp.settings.allowed_hosts = ["*"]  # type: ignore[attr-defined]
+except Exception as e:
+    logger.info(f"Could not set mcp.settings (older version?): {e}")
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
