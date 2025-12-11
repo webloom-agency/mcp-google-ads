@@ -903,13 +903,15 @@ def _adjust_change_event_query(query: str) -> str:
     logger.info(f"🔧 Adjusting change_event query...")
     adjusted = query
     
-    # Replace LAST_30_DAYS or LAST_MONTH with explicit date >= (today - 29 days)
+    # Replace LAST_30_DAYS or LAST_MONTH with explicit date range (BETWEEN)
+    # 29 days until yesterday (excluding today)
     if re.search(r'DURING\s+(LAST_30_DAYS|LAST_MONTH)', adjusted, re.IGNORECASE):
-        start_date = (datetime.now() - timedelta(days=29)).strftime('%Y-%m-%d')
-        logger.info(f"📅 Replacing LAST_30_DAYS/LAST_MONTH with date >= {start_date}")
+        end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')  # Yesterday
+        start_date = (datetime.now() - timedelta(days=29)).strftime('%Y-%m-%d')  # 29 days ago
+        logger.info(f"📅 Replacing LAST_30_DAYS/LAST_MONTH with BETWEEN {start_date} AND {end_date} (29 days until yesterday)")
         adjusted = re.sub(
             r'(\w+\.\w+)\s+DURING\s+(LAST_30_DAYS|LAST_MONTH)',
-            rf"\1 >= '{start_date}'",
+            rf"\1 BETWEEN '{start_date}' AND '{end_date}'",
             adjusted,
             flags=re.IGNORECASE
         )
