@@ -26,19 +26,34 @@ if 'mcp.server.transport_security' not in sys.modules:
     import types
     mock_module = types.ModuleType('mcp.server.transport_security')
     
-    # Create a no-op middleware that doesn't validate
-    from starlette.middleware.base import BaseHTTPMiddleware as _BaseMiddleware
-    class _NoOpSecurityMiddleware(_BaseMiddleware):
-        async def dispatch(self, request, call_next):
-            return await call_next(request)
+    # Create a security class that implements validate_request (not a middleware)
+    class _PermissiveTransportSecurity:
+        def __init__(self, allowed_hosts=None):
+            # Ignore allowed_hosts parameter
+            self.allowed_hosts = None
+        
+        async def validate_request(self, request, is_post=False):
+            # Always return None (no error) to allow all requests
+            # Bearer token middleware provides the real security
+            host = request.headers.get('host', 'unknown')
+            print(f"🔓 Transport security: allowing Host {host} (Bearer token validates)")
+            return None  # None means validation passed
     
     # Create settings class that always disables validation
-    from pydantic import BaseModel as _BaseModel
-    class _NoOpSecuritySettings(_BaseModel):
-        allowed_hosts: list = None
+    from pydantic import BaseModel as _BaseModel, Field as _Field
+    from typing import Optional as _Optional, List as _List
+    class _PermissiveSecuritySettings(_BaseModel):
+        allowed_hosts: _Optional[_List[str]] = _Field(default=None)
+        
+        class Config:
+            extra = "allow"  # Allow extra fields
     
-    mock_module.TransportSecurityMiddleware = _NoOpSecurityMiddleware
-    mock_module.TransportSecuritySettings = _NoOpSecuritySettings
+    # Add necessary module attributes
+    mock_module.TransportSecurityMiddleware = _PermissiveTransportSecurity
+    mock_module.TransportSecuritySettings = _PermissiveSecuritySettings
+    mock_module.logger = None  # Placeholder
+    mock_module.logging = logging
+    
     sys.modules['mcp.server.transport_security'] = mock_module
     print("✓ Pre-patched transport_security module before MCP import")
 
