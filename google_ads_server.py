@@ -897,19 +897,23 @@ def _adjust_change_event_query(query: str) -> str:
     """
     # Only adjust if query contains 'change_event'
     if 'change_event' not in query.lower():
+        logger.debug(f"Query does not contain change_event, skipping adjustment")
         return query
     
+    logger.info(f"🔧 Adjusting change_event query...")
     adjusted = query
     
     # Replace LAST_30_DAYS or LAST_MONTH with explicit date >= (today - 29 days)
     if re.search(r'DURING\s+(LAST_30_DAYS|LAST_MONTH)', adjusted, re.IGNORECASE):
         start_date = (datetime.now() - timedelta(days=29)).strftime('%Y-%m-%d')
+        logger.info(f"📅 Replacing LAST_30_DAYS/LAST_MONTH with date >= {start_date}")
         adjusted = re.sub(
             r'(\w+\.\w+)\s+DURING\s+(LAST_30_DAYS|LAST_MONTH)',
             rf"\1 >= '{start_date}'",
             adjusted,
             flags=re.IGNORECASE
         )
+        logger.info(f"✅ Adjusted query: {adjusted[:200]}...")
     
     # Ensure LIMIT is present (add if missing, cap if > 10000)
     limit_match = re.search(r'LIMIT\s+(\d+)', adjusted, re.IGNORECASE)
@@ -917,9 +921,11 @@ def _adjust_change_event_query(query: str) -> str:
         limit_val = int(limit_match.group(1))
         if limit_val > 10000:
             adjusted = re.sub(r'LIMIT\s+\d+', 'LIMIT 10000', adjusted, flags=re.IGNORECASE)
+            logger.info(f"⚠️ Capped LIMIT to 10000 (was {limit_val})")
     else:
         # Append LIMIT if not present
         adjusted = adjusted.rstrip() + ' LIMIT 10000'
+        logger.info(f"➕ Added LIMIT 10000")
     
     return adjusted
 
