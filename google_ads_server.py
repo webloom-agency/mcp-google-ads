@@ -7,6 +7,7 @@ import re
 import time
 import difflib
 import logging
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -797,6 +798,40 @@ async def list_manager_clients(
         return f"Error: {str(e)}"
 
 # ------- Query tools (all accept name or ID; prefer non-MCC automatically) -------
+def _adjust_change_event_query(query: str) -> str:
+    """
+    Adjusts change_event queries to comply with Google Ads API restrictions:
+    - Replaces LAST_30_DAYS/LAST_MONTH with explicit date range (29 days max)
+    - Ensures LIMIT is present (max 10000)
+    """
+    # Only adjust if query contains 'change_event'
+    if 'change_event' not in query.lower():
+        return query
+    
+    adjusted = query
+    
+    # Replace LAST_30_DAYS or LAST_MONTH with explicit date >= (today - 29 days)
+    if re.search(r'DURING\s+(LAST_30_DAYS|LAST_MONTH)', adjusted, re.IGNORECASE):
+        start_date = (datetime.now() - timedelta(days=29)).strftime('%Y-%m-%d')
+        adjusted = re.sub(
+            r'(\w+\.\w+)\s+DURING\s+(LAST_30_DAYS|LAST_MONTH)',
+            rf"\1 >= '{start_date}'",
+            adjusted,
+            flags=re.IGNORECASE
+        )
+    
+    # Ensure LIMIT is present (add if missing, cap if > 10000)
+    limit_match = re.search(r'LIMIT\s+(\d+)', adjusted, re.IGNORECASE)
+    if limit_match:
+        limit_val = int(limit_match.group(1))
+        if limit_val > 10000:
+            adjusted = re.sub(r'LIMIT\s+\d+', 'LIMIT 10000', adjusted, flags=re.IGNORECASE)
+    else:
+        # Append LIMIT if not present
+        adjusted = adjusted.rstrip() + ' LIMIT 10000'
+    
+    return adjusted
+
 @mcp.tool()
 async def execute_gaql_query(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
@@ -901,42 +936,6 @@ async def get_ad_performance(
         ORDER BY metrics.impressions DESC
     """
     return await execute_gaql_query(customer_id, query, login_customer_id)
-
-def _adjust_change_event_query(query: str) -> str:
-    """
-    Adjusts change_event queries to comply with Google Ads API restrictions:
-    - Replaces LAST_30_DAYS/LAST_MONTH with explicit date range (29 days max)
-    - Ensures LIMIT is present (max 10000)
-    """
-    from datetime import datetime, timedelta
-    
-    # Only adjust if query contains 'change_event'
-    if 'change_event' not in query.lower():
-        return query
-    
-    adjusted = query
-    
-    # Replace LAST_30_DAYS or LAST_MONTH with explicit date >= (today - 29 days)
-    if re.search(r'DURING\s+(LAST_30_DAYS|LAST_MONTH)', adjusted, re.IGNORECASE):
-        start_date = (datetime.now() - timedelta(days=29)).strftime('%Y-%m-%d')
-        adjusted = re.sub(
-            r'(\w+\.\w+)\s+DURING\s+(LAST_30_DAYS|LAST_MONTH)',
-            rf"\1 >= '{start_date}'",
-            adjusted,
-            flags=re.IGNORECASE
-        )
-    
-    # Ensure LIMIT is present (add if missing, cap if > 10000)
-    limit_match = re.search(r'LIMIT\s+(\d+)', adjusted, re.IGNORECASE)
-    if limit_match:
-        limit_val = int(limit_match.group(1))
-        if limit_val > 10000:
-            adjusted = re.sub(r'LIMIT\s+\d+', 'LIMIT 10000', adjusted, flags=re.IGNORECASE)
-    else:
-        # Append LIMIT if not present
-        adjusted = adjusted.rstrip() + ' LIMIT 10000'
-    
-    return adjusted
 
 @mcp.tool()
 async def run_gaql(
