@@ -1429,8 +1429,8 @@ MCP_HTTP_PATH = os.getenv("MCP_HTTP_PATH", "/mcp")
 try:
     # On newer fastmcp versions
     mcp.settings.streamable_http_path = MCP_HTTP_PATH  # type: ignore[attr-defined]
-    # Allow Render hostname to pass Host header validation
-    mcp.settings.allowed_hosts = ["*"]  # type: ignore[attr-defined]
+    # Disable Host header validation for Render - use None instead of ["*"]
+    mcp.settings.allowed_hosts = None  # type: ignore[attr-defined]
 except Exception as e:
     logger.info(f"Could not set mcp.settings (older version?): {e}")
 
@@ -1462,7 +1462,18 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
+# Create app and disable host validation after creation
 app = mcp.streamable_http_app()
+
+# Monkey-patch to disable Host header validation
+try:
+    if hasattr(app, 'state') and hasattr(app.state, '_mcp_transport_manager'):
+        manager = app.state._mcp_transport_manager
+        if hasattr(manager, '_transport_security'):
+            manager._transport_security.allowed_hosts = None
+            logger.info("Disabled Host header validation for Render deployment")
+except Exception as e:
+    logger.warning(f"Could not disable Host header validation: {e}")
 
 # Add Bearer auth enforcement if MCP_BEARER_TOKEN is set
 app.add_middleware(BearerAuthMiddleware)
