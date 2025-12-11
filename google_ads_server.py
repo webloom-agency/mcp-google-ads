@@ -812,8 +812,11 @@ async def execute_gaql_query(
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id)
 
+        # Auto-adjust change_event queries for API restrictions
+        adjusted_query = _adjust_change_event_query(query)
+
         # Fetch all rows via pagination helper (no page size parameter sent)
-        rows = _gaql_search_all(cid, query, headers)
+        rows = _gaql_search_all(cid, adjusted_query, headers)
         if not rows:
             return "No results found for the query."
 
@@ -899,6 +902,42 @@ async def get_ad_performance(
     """
     return await execute_gaql_query(customer_id, query, login_customer_id)
 
+def _adjust_change_event_query(query: str) -> str:
+    """
+    Adjusts change_event queries to comply with Google Ads API restrictions:
+    - Replaces LAST_30_DAYS/LAST_MONTH with explicit date range (29 days max)
+    - Ensures LIMIT is present (max 10000)
+    """
+    from datetime import datetime, timedelta
+    
+    # Only adjust if query contains 'change_event'
+    if 'change_event' not in query.lower():
+        return query
+    
+    adjusted = query
+    
+    # Replace LAST_30_DAYS or LAST_MONTH with explicit date >= (today - 29 days)
+    if re.search(r'DURING\s+(LAST_30_DAYS|LAST_MONTH)', adjusted, re.IGNORECASE):
+        start_date = (datetime.now() - timedelta(days=29)).strftime('%Y-%m-%d')
+        adjusted = re.sub(
+            r'(\w+\.\w+)\s+DURING\s+(LAST_30_DAYS|LAST_MONTH)',
+            rf"\1 >= '{start_date}'",
+            adjusted,
+            flags=re.IGNORECASE
+        )
+    
+    # Ensure LIMIT is present (add if missing, cap if > 10000)
+    limit_match = re.search(r'LIMIT\s+(\d+)', adjusted, re.IGNORECASE)
+    if limit_match:
+        limit_val = int(limit_match.group(1))
+        if limit_val > 10000:
+            adjusted = re.sub(r'LIMIT\s+\d+', 'LIMIT 10000', adjusted, flags=re.IGNORECASE)
+    else:
+        # Append LIMIT if not present
+        adjusted = adjusted.rstrip() + ' LIMIT 10000'
+    
+    return adjusted
+
 @mcp.tool()
 async def run_gaql(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
@@ -911,8 +950,11 @@ async def run_gaql(
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id)
 
+        # Auto-adjust change_event queries for API restrictions
+        adjusted_query = _adjust_change_event_query(query)
+
         # Fetch all rows with pagination (no artificial caps)
-        rows = _gaql_search_all(cid, query, headers)
+        rows = _gaql_search_all(cid, adjusted_query, headers)
         if not rows:
             return "No results found for the query."
 
