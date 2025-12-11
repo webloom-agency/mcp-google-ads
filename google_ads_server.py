@@ -35,36 +35,40 @@ try:
     from mcp.server import transport_security
     from mcp.server import streamable_http_manager
     
-    # Debug: inspect what's in the module
-    logger.info(f"📦 transport_security module contents: {dir(transport_security)}")
-    logger.info(f"📦 streamable_http_manager module contents: {dir(streamable_http_manager)}")
-    
-    # Patch the TransportSecurity class itself
-    if hasattr(transport_security, 'TransportSecurity'):
-        OriginalTransportSecurity = transport_security.TransportSecurity
+    # Patch TransportSecurityMiddleware to bypass host validation
+    if hasattr(transport_security, 'TransportSecurityMiddleware'):
+        OriginalMiddleware = transport_security.TransportSecurityMiddleware
         
-        class PatchedTransportSecurity(OriginalTransportSecurity):
-            def validate_host(self, host):
-                # Always return True to bypass validation
-                logger.info(f"🔓 Bypassing Host validation for: {host}")
-                return True
-            
+        class PatchedMiddleware(OriginalMiddleware):
+            async def dispatch(self, request, call_next):
+                # Skip host validation entirely - just call next
+                logger.info(f"🔓 Bypassing Host validation for: {request.headers.get('host', 'unknown')}")
+                return await call_next(request)
+        
+        transport_security.TransportSecurityMiddleware = PatchedMiddleware
+        logger.info("✓ Patched TransportSecurityMiddleware to bypass Host validation")
+    
+    # Also patch in streamable_http_manager if it references it
+    if hasattr(streamable_http_manager, 'TransportSecurityMiddleware'):
+        streamable_http_manager.TransportSecurityMiddleware = transport_security.TransportSecurityMiddleware
+        logger.info("✓ Updated TransportSecurityMiddleware reference in streamable_http_manager")
+    
+    # Patch TransportSecuritySettings to disable validation by default
+    if hasattr(transport_security, 'TransportSecuritySettings'):
+        OriginalSettings = transport_security.TransportSecuritySettings
+        
+        class PatchedSettings(OriginalSettings):
             def __init__(self, *args, **kwargs):
-                # Force allowed_hosts to None to disable validation
-                if 'allowed_hosts' in kwargs:
-                    del kwargs['allowed_hosts']
+                # Force allowed_hosts to None (disables validation)
+                kwargs['allowed_hosts'] = None
                 super().__init__(*args, **kwargs)
-                # Override after init
-                self.allowed_hosts = None
-                self._allowed_hosts = None
         
-        transport_security.TransportSecurity = PatchedTransportSecurity
-        logger.info("✓ Patched TransportSecurity class to bypass Host validation")
+        transport_security.TransportSecuritySettings = PatchedSettings
+        logger.info("✓ Patched TransportSecuritySettings to disable Host validation")
     
-    # Also patch the streamable_http_manager if it imports TransportSecurity
-    if hasattr(streamable_http_manager, 'TransportSecurity'):
-        streamable_http_manager.TransportSecurity = transport_security.TransportSecurity
-        logger.info("✓ Updated TransportSecurity reference in streamable_http_manager")
+    if hasattr(streamable_http_manager, 'TransportSecuritySettings'):
+        streamable_http_manager.TransportSecuritySettings = transport_security.TransportSecuritySettings
+        logger.info("✓ Updated TransportSecuritySettings reference in streamable_http_manager")
         
 except Exception as e:
     logger.error(f"❌ Could not patch transport_security: {e}")
