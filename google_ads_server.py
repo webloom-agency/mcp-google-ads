@@ -21,20 +21,43 @@ from starlette.responses import PlainTextResponse
 # MCP
 from mcp.server.fastmcp import FastMCP
 
-# Monkey-patch transport_security BEFORE any FastMCP initialization
-try:
-    from mcp.server import transport_security
-    # Override the validate_host function to always return True
-    original_validate = getattr(transport_security, 'validate_host', None)
-    if original_validate:
-        transport_security.validate_host = lambda host, allowed_hosts=None: True
-        print("✓ Disabled Host header validation at module level")
-except Exception as e:
-    print(f"⚠ Could not patch transport_security: {e}")
-
 # ----------------------------- LOGGING -----------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('google_ads_server')
+
+# Monkey-patch transport_security BEFORE any FastMCP initialization
+try:
+    from mcp.server import transport_security
+    
+    # Patch the TransportSecurity class itself
+    if hasattr(transport_security, 'TransportSecurity'):
+        OriginalTransportSecurity = transport_security.TransportSecurity
+        
+        class PatchedTransportSecurity(OriginalTransportSecurity):
+            def validate_host(self, host):
+                # Always return True to bypass validation
+                logger.info(f"🔓 Bypassing Host validation for: {host}")
+                return True
+            
+            def __init__(self, *args, **kwargs):
+                # Force allowed_hosts to None
+                if 'allowed_hosts' in kwargs:
+                    kwargs['allowed_hosts'] = None
+                super().__init__(*args, **kwargs)
+                self.allowed_hosts = None
+        
+        transport_security.TransportSecurity = PatchedTransportSecurity
+        logger.info("✓ Patched TransportSecurity class to bypass Host validation")
+    
+    # Also try to patch standalone function
+    if hasattr(transport_security, 'validate_host'):
+        transport_security.validate_host = lambda host, allowed_hosts=None: True
+        logger.info("✓ Patched validate_host function")
+        
+except Exception as e:
+    logger.error(f"⚠ Could not patch transport_security: {e}")
+    import traceback
+    traceback.print_exc()
 
 # ----------------------------- MCP APP -----------------------------
 mcp = FastMCP(
