@@ -35,6 +35,10 @@ try:
     from mcp.server import transport_security
     from mcp.server import streamable_http_manager
     
+    # Debug: inspect what's in the module
+    logger.info(f"📦 transport_security module contents: {dir(transport_security)}")
+    logger.info(f"📦 streamable_http_manager module contents: {dir(streamable_http_manager)}")
+    
     # Patch the TransportSecurity class itself
     if hasattr(transport_security, 'TransportSecurity'):
         OriginalTransportSecurity = transport_security.TransportSecurity
