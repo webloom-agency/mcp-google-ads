@@ -63,9 +63,11 @@ try:
         logger.info("✓ Updated TransportSecurity reference in streamable_http_manager")
         
 except Exception as e:
-    logger.error(f"⚠ Could not patch transport_security: {e}")
+    logger.error(f"❌ Could not patch transport_security: {e}")
     import traceback
     traceback.print_exc()
+else:
+    logger.info("✅ Transport security patch block completed without exceptions")
 
 # ----------------------------- MCP APP -----------------------------
 mcp = FastMCP(
