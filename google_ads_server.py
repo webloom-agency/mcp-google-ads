@@ -1564,6 +1564,183 @@ async def get_campaign_budgets(
     )
 
 @mcp.tool()
+async def get_search_terms(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    max_results: int = Field(default=50, description="Max search terms to show in detail (default 50)"),
+    order_by: str = Field(default="cost", description="Sort by: 'cost', 'clicks', 'conversions', 'impressions'"),
+    status_filter: Optional[str] = Field(default=None, description="Filter by status: 'ADDED', 'EXCLUDED', 'NONE', or None for all"),
+    format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'json'"),
+    min_impressions: int = Field(default=10, description="Minimum impressions filter (default 10)"),
+    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
+) -> str:
+    """
+    Get search terms report with smart summarization.
+    
+    format='summary' (default): Shows aggregate totals for ALL search terms + top N by cost/conversions.
+    Groups by status (ADDED, EXCLUDED, NONE). NO DATA LOST in aggregates.
+    """
+    if days in (7, 14, 30, 60, 90, 180):
+        date_range = f"LAST_{days}_DAYS"
+    else:
+        date_range = "LAST_30_DAYS"
+
+    # Build WHERE clause
+    where_clauses = [
+        f"segments.date DURING {date_range}",
+        "campaign.status = 'ENABLED'"
+    ]
+    if min_impressions > 0:
+        where_clauses.append(f"metrics.impressions >= {min_impressions}")
+    if status_filter:
+        where_clauses.append(f"search_term_view.status = '{status_filter.upper()}'")
+    where_str = " AND ".join(where_clauses)
+
+    # Map order_by
+    order_map = {
+        "cost": "metrics.cost_micros DESC",
+        "clicks": "metrics.clicks DESC",
+        "conversions": "metrics.conversions DESC",
+        "impressions": "metrics.impressions DESC"
+    }
+    order_clause = order_map.get(order_by.lower(), "metrics.cost_micros DESC")
+
+    query = f"""
+        SELECT
+            campaign.name,
+            ad_group.name,
+            search_term_view.search_term,
+            search_term_view.status,
+            metrics.clicks,
+            metrics.impressions,
+            metrics.ctr,
+            metrics.average_cpc,
+            metrics.cost_micros,
+            metrics.conversions
+        FROM search_term_view
+        WHERE {where_str}
+        ORDER BY {order_clause}
+    """
+    
+    # For summary format, fetch ALL and summarize
+    if format == "summary":
+        try:
+            creds = get_credentials()
+            cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+            headers = get_headers(creds, login_customer_id=login_customer_id)
+            
+            rows = _gaql_search_all(cid, query, headers)
+            if not rows:
+                return "No search term data found."
+            
+            total_count = len(rows)
+            
+            # Aggregate by status
+            by_status = {"ADDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0},
+                        "EXCLUDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0},
+                        "NONE": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0}}
+            
+            total_clicks = 0
+            total_impressions = 0
+            total_cost = 0
+            total_conversions = 0
+            
+            for row in rows:
+                stv = row.get("searchTermView", {})
+                metrics = row.get("metrics", {})
+                
+                status = stv.get("status", "NONE")
+                clicks = int(metrics.get("clicks", 0))
+                impr = int(metrics.get("impressions", 0))
+                cost = int(metrics.get("costMicros", 0))
+                conv = float(metrics.get("conversions", 0))
+                
+                if status in by_status:
+                    by_status[status]["count"] += 1
+                    by_status[status]["clicks"] += clicks
+                    by_status[status]["impr"] += impr
+                    by_status[status]["cost"] += cost
+                    by_status[status]["conv"] += conv
+                
+                total_clicks += clicks
+                total_impressions += impr
+                total_cost += cost
+                total_conversions += conv
+            
+            avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
+            avg_cpc = (total_cost / total_clicks) if total_clicks > 0 else 0
+            
+            lines = [
+                f"Search Terms Summary for {cid}",
+                "=" * 100,
+                f"Total search terms analyzed: {total_count}",
+                f"Showing detailed breakdown for top {min(max_results, total_count)} terms",
+                "",
+                "📊 AGGREGATE TOTALS (All Search Terms):",
+                f"   Total Impressions: {total_impressions:,}",
+                f"   Total Clicks: {total_clicks:,}",
+                f"   Total Cost: ${total_cost / 1_000_000:,.2f}",
+                f"   Total Conversions: {total_conversions:,.2f}",
+                f"   Average CTR: {avg_ctr:.2f}%",
+                f"   Average CPC: ${avg_cpc / 1_000_000:.2f}",
+                "",
+                "🏷️  BY STATUS:",
+                ""
+            ]
+            
+            for status, data in by_status.items():
+                if data["count"] > 0:
+                    status_ctr = (data["clicks"] / data["impr"] * 100) if data["impr"] > 0 else 0
+                    lines.append(f"   {status} ({data['count']} terms):")
+                    lines.append(f"      Impressions: {data['impr']:,} | Clicks: {data['clicks']:,} | CTR: {status_ctr:.2f}%")
+                    lines.append(f"      Cost: ${data['cost'] / 1_000_000:,.2f} | Conversions: {data['conv']:,.2f}")
+                    lines.append("")
+            
+            lines.extend([
+                "🎯 TOP SEARCH TERMS (Detailed):",
+                "=" * 100
+            ])
+            
+            # Show top results
+            for i, row in enumerate(rows[:max_results], 1):
+                stv = row.get("searchTermView", {})
+                campaign = row.get("campaign", {})
+                ad_group = row.get("adGroup", {})
+                metrics = row.get("metrics", {})
+                
+                term = stv.get("searchTerm", "(no term)")
+                status = stv.get("status", "NONE")
+                clicks = int(metrics.get("clicks", 0))
+                impr = int(metrics.get("impressions", 0))
+                cost = int(metrics.get("costMicros", 0))
+                conv = float(metrics.get("conversions", 0))
+                ctr = float(metrics.get("ctr", 0)) * 100
+                cpc = int(metrics.get("averageCpc", 0))
+                
+                lines.append(f"\n{i}. \"{term}\" [{status}]")
+                lines.append(f"   Campaign: {campaign.get('name', 'Unknown')}")
+                lines.append(f"   Impressions: {impr:,} | Clicks: {clicks:,} | CTR: {ctr:.2f}%")
+                lines.append(f"   Cost: ${cost / 1_000_000:,.2f} | CPC: ${cpc / 1_000_000:.2f} | Conversions: {conv:.2f}")
+            
+            if total_count > max_results:
+                lines.append(f"\n... and {total_count - max_results} more search terms (included in aggregate totals above)")
+            
+            return "\n".join(lines)
+            
+        except Exception as e:
+            return f"Error getting search terms: {str(e)}"
+    
+    # For other formats, limit results
+    return await run_gaql(
+        customer_id=customer_id,
+        query=query + f" LIMIT {max_results}",
+        format=format,
+        max_results=None,
+        fields=None,
+        login_customer_id=login_customer_id
+    )
+
+@mcp.tool()
 async def get_change_history(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     days: int = Field(default=7, description="Number of days to look back (max 29)"),
