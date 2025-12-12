@@ -937,7 +937,7 @@ def _summarize_performance_data(rows: List[Dict], cid: str, total: int, max_show
         total_clicks += int(metrics.get("clicks", 0))
         total_cost += int(metrics.get("costMicros", 0))
         total_conversions += float(metrics.get("conversions", 0))
-        total_conversion_value += float(metrics.get("conversionValue", 0))
+        total_conversion_value += float(metrics.get("conversionsValue", 0))
     
     # Calculate aggregates
     avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
@@ -1217,7 +1217,7 @@ async def get_campaign_performance(
             metrics.clicks,
             metrics.cost_micros,
             metrics.conversions,
-            metrics.conversion_value,
+            metrics.conversions_value,
             metrics.average_cpc,
             metrics.ctr
         FROM campaign
@@ -1308,7 +1308,7 @@ async def get_ad_performance(
             metrics.clicks,
             metrics.cost_micros,
             metrics.conversions,
-            metrics.conversion_value,
+            metrics.conversions_value,
             metrics.ctr,
             metrics.average_cpc
         FROM ad_group_ad
@@ -1403,7 +1403,7 @@ async def get_keyword_performance(
             metrics.clicks,
             metrics.cost_micros,
             metrics.conversions,
-            metrics.conversion_value,
+            metrics.conversions_value,
             metrics.ctr,
             metrics.average_cpc,
             metrics.search_impression_share
