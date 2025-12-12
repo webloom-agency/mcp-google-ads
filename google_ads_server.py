@@ -1247,6 +1247,8 @@ async def get_campaign_performance(
                         customer_id=customer_id,
                         query=query + f" LIMIT {total_count}",
                         format="table",
+                        max_results=None,
+                        fields=None,
                         login_customer_id=login_customer_id
                     )
                 else:
@@ -1263,6 +1265,8 @@ async def get_campaign_performance(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
         format=format,
+        max_results=None,
+        fields=None,
         login_customer_id=login_customer_id
     )
 
@@ -1347,6 +1351,8 @@ async def get_ad_performance(
                         customer_id=customer_id,
                         query=query + f" LIMIT {total_count}",
                         format="table",
+                        max_results=None,
+                        fields=None,
                         login_customer_id=login_customer_id
                     )
                 else:
@@ -1361,6 +1367,8 @@ async def get_ad_performance(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
         format=format,
+        max_results=None,
+        fields=None,
         login_customer_id=login_customer_id
     )
 
@@ -1453,6 +1461,8 @@ async def get_keyword_performance(
                         customer_id=customer_id,
                         query=query + f" LIMIT {total_count}",
                         format="table",
+                        max_results=None,
+                        fields=None,
                         login_customer_id=login_customer_id
                     )
                 else:
@@ -1467,6 +1477,8 @@ async def get_keyword_performance(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
         format=format,
+        max_results=None,
+        fields=None,
         login_customer_id=login_customer_id
     )
 
@@ -1542,6 +1554,8 @@ async def get_change_history(
         customer_id=customer_id,
         query=query,
         format=format,
+        max_results=max_results,
+        fields=None,
         login_customer_id=login_customer_id
     )
 
