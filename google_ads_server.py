@@ -1175,17 +1175,15 @@ async def get_campaign_performance(
     max_results: int = Field(default=50, description="Max campaigns to show in detail (default 50). Aggregates include ALL campaigns"),
     order_by: str = Field(default="cost", description="Sort by: 'cost', 'conversions', 'clicks', 'impressions', or 'name'"),
     status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
-    format: str = Field(default="auto", description="'auto' (smart), 'summary' (aggregates+top N), 'table', 'compact', 'csv', 'json'"),
-    auto_summarize_threshold: int = Field(default=100, description="If format='auto', summarize when results > this (default 100)"),
+    format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'compact', 'csv', 'json'"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
-    Get campaign performance with INTELLIGENT auto-summarization.
+    Get campaign performance with smart summarization.
     
-    format='auto' (default): Small datasets (≤100) → full table | Large datasets (>100) → summary
-    format='summary': Always show aggregates (ALL data) + top N details
-    
-    NO DATA LOST: Aggregates always include ALL campaigns, detailed view shows top N.
+    format='summary' (default): Shows aggregate totals for ALL campaigns + top N detailed breakdown.
+    NO DATA LOST: Aggregates include ALL campaigns, detailed view shows top N.
+    Use format='table'/'json' for raw data (may be large).
     """
     if days in (7, 14, 30, 60, 90, 180):
         date_range = f"LAST_{days}_DAYS"
@@ -1225,8 +1223,8 @@ async def get_campaign_performance(
         ORDER BY {order_clause}
     """
     
-    # Intelligent format selection
-    if format in ("auto", "summary"):
+    # For summary format, fetch ALL data and summarize
+    if format == "summary":
         try:
             creds = get_credentials()
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
@@ -1237,30 +1235,12 @@ async def get_campaign_performance(
                 return "No campaign performance data found."
             
             total_count = len(rows)
-            
-            # AUTO mode: decide based on data size
-            if format == "auto":
-                if total_count <= auto_summarize_threshold:
-                    logger.info(f"📊 Auto: {total_count} campaigns ≤ {auto_summarize_threshold}, showing full table")
-                    # Show full table
-                    return await run_gaql(
-                        customer_id=customer_id,
-                        query=query + f" LIMIT {total_count}",
-                        format="table",
-                        max_results=None,
-                        fields=None,
-                        login_customer_id=login_customer_id
-                    )
-                else:
-                    logger.info(f"📊 Auto: {total_count} campaigns > {auto_summarize_threshold}, using summary")
-                    return _summarize_performance_data(rows, cid, total_count, max_results, "campaign")
-            else:
-                # Explicit summary request
-                return _summarize_performance_data(rows, cid, total_count, max_results, "campaign")
+            logger.info(f"📊 Summary mode: {total_count} campaigns, showing aggregates + top {max_results}")
+            return _summarize_performance_data(rows, cid, total_count, max_results, "campaign")
         except Exception as e:
             return f"Error getting campaign performance: {str(e)}"
     
-    # Other formats
+    # For other formats (table, json, csv, compact), limit results for performance
     return await run_gaql(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
@@ -1277,16 +1257,16 @@ async def get_ad_performance(
     max_results: int = Field(default=50, description="Max ads to show in detail (default 50). Aggregates include ALL ads"),
     order_by: str = Field(default="impressions", description="Sort by: 'impressions', 'clicks', 'conversions', 'cost', or 'ctr'"),
     status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
-    format: str = Field(default="auto", description="'auto' (smart), 'summary' (aggregates+top N), 'table', 'compact', 'csv', 'json'"),
+    format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'compact', 'csv', 'json'"),
     min_impressions: int = Field(default=0, description="Minimum impressions filter (default 0)"),
-    auto_summarize_threshold: int = Field(default=100, description="If format='auto', summarize when results > this (default 100)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
-    Get ad performance with INTELLIGENT auto-summarization.
+    Get ad performance with smart summarization.
     
-    format='auto' (default): Small datasets (≤100) → full table | Large datasets (>100) → summary
-    NO DATA LOST: Aggregates always include ALL ads, detailed view shows top N.
+    format='summary' (default): Shows aggregate totals for ALL ads + top N detailed breakdown.
+    NO DATA LOST: Aggregates include ALL ads, detailed view shows top N.
+    Use format='table'/'json' for raw data (may be large).
     """
     if days in (7, 14, 30, 60, 90, 180):
         date_range = f"LAST_{days}_DAYS"
@@ -1330,8 +1310,8 @@ async def get_ad_performance(
         ORDER BY {order_clause}
     """
     
-    # Intelligent format selection
-    if format in ("auto", "summary"):
+    # For summary format, fetch ALL data and summarize
+    if format == "summary":
         try:
             creds = get_credentials()
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
@@ -1342,27 +1322,12 @@ async def get_ad_performance(
                 return "No ad performance data found."
             
             total_count = len(rows)
-            
-            # AUTO mode
-            if format == "auto":
-                if total_count <= auto_summarize_threshold:
-                    logger.info(f"📊 Auto: {total_count} ads ≤ {auto_summarize_threshold}, showing full table")
-                    return await run_gaql(
-                        customer_id=customer_id,
-                        query=query + f" LIMIT {total_count}",
-                        format="table",
-                        max_results=None,
-                        fields=None,
-                        login_customer_id=login_customer_id
-                    )
-                else:
-                    logger.info(f"📊 Auto: {total_count} ads > {auto_summarize_threshold}, using summary")
-                    return _summarize_performance_data(rows, cid, total_count, max_results, "ad")
-            else:
-                return _summarize_performance_data(rows, cid, total_count, max_results, "ad")
+            logger.info(f"📊 Summary mode: {total_count} ads, showing aggregates + top {max_results}")
+            return _summarize_performance_data(rows, cid, total_count, max_results, "ad")
         except Exception as e:
             return f"Error getting ad performance: {str(e)}"
     
+    # For other formats (table, json, csv, compact), limit results for performance
     return await run_gaql(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
@@ -1380,17 +1345,17 @@ async def get_keyword_performance(
     order_by: str = Field(default="impressions", description="Sort by: 'impressions', 'clicks', 'conversions', 'cost', 'ctr', 'quality_score'"),
     status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
     match_type: Optional[str] = Field(default=None, description="Filter by match type: 'EXACT', 'PHRASE', 'BROAD', or None for all"),
-    format: str = Field(default="auto", description="'auto' (smart), 'summary' (aggregates+top N), 'table', 'compact', 'csv', 'json'"),
+    format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'compact', 'csv', 'json'"),
     min_impressions: int = Field(default=10, description="Minimum impressions filter (default 10 to exclude low-volume keywords)"),
-    auto_summarize_threshold: int = Field(default=100, description="If format='auto', summarize when results > this (default 100)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
-    Get keyword performance with INTELLIGENT auto-summarization.
+    Get keyword performance with smart summarization.
     
-    format='auto' (default): Small datasets (≤100) → full table | Large datasets (>100) → summary
-    NO DATA LOST: Aggregates always include ALL keywords, detailed view shows top N.
+    format='summary' (default): Shows aggregate totals for ALL keywords + top N detailed breakdown.
+    NO DATA LOST: Aggregates include ALL keywords, detailed view shows top N.
     Filters out keywords with <10 impressions by default.
+    Use format='table'/'json' for raw data (may be large).
     """
     if days in (7, 14, 30, 60, 90, 180):
         date_range = f"LAST_{days}_DAYS"
@@ -1440,8 +1405,8 @@ async def get_keyword_performance(
         ORDER BY {order_clause}
     """
     
-    # Intelligent format selection
-    if format in ("auto", "summary"):
+    # For summary format, fetch ALL data and summarize  
+    if format == "summary":
         try:
             creds = get_credentials()
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
@@ -1452,27 +1417,12 @@ async def get_keyword_performance(
                 return "No keyword performance data found."
             
             total_count = len(rows)
-            
-            # AUTO mode
-            if format == "auto":
-                if total_count <= auto_summarize_threshold:
-                    logger.info(f"📊 Auto: {total_count} keywords ≤ {auto_summarize_threshold}, showing full table")
-                    return await run_gaql(
-                        customer_id=customer_id,
-                        query=query + f" LIMIT {total_count}",
-                        format="table",
-                        max_results=None,
-                        fields=None,
-                        login_customer_id=login_customer_id
-                    )
-                else:
-                    logger.info(f"📊 Auto: {total_count} keywords > {auto_summarize_threshold}, using summary")
-                    return _summarize_performance_data(rows, cid, total_count, max_results, "keyword")
-            else:
-                return _summarize_performance_data(rows, cid, total_count, max_results, "keyword")
+            logger.info(f"📊 Summary mode: {total_count} keywords, showing aggregates + top {max_results}")
+            return _summarize_performance_data(rows, cid, total_count, max_results, "keyword")
         except Exception as e:
             return f"Error getting keyword performance: {str(e)}"
     
+    # For other formats (table, json, csv, compact), limit results for performance
     return await run_gaql(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
