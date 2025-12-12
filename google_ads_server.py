@@ -889,6 +889,185 @@ async def list_manager_clients(
         return f"Error: {str(e)}"
 
 # ------- Query tools (all accept name or ID; prefer non-MCC automatically) -------
+def _format_compact(rows: List[Dict], fields: List[str], cid: str, total: int, max_shown: Optional[int]) -> str:
+    """Format results in a compact, readable format with minimal whitespace."""
+    lines = [f"Results for {cid} ({len(rows)}/{total}):"]
+    
+    # For compact format, show only most essential fields (first 5)
+    key_fields = fields[:5] if len(fields) > 5 else fields
+    
+    for i, row in enumerate(rows, 1):
+        vals = []
+        for f in key_fields:
+            if "." in f:
+                p, c = f.split(".", 1)
+                v = str(row.get(p, {}).get(c, ""))
+            else:
+                v = str(row.get(f, ""))
+            # Truncate long values
+            if len(v) > 50:
+                v = v[:47] + "..."
+            vals.append(f"{f.split('.')[-1]}:{v}")
+        lines.append(f"{i}. " + " | ".join(vals))
+    
+    if max_shown and total > max_shown:
+        lines.append(f"\n... and {total - max_shown} more results")
+    return "\n".join(lines)
+
+def _summarize_performance_data(rows: List[Dict], cid: str, total: int, max_shown: Optional[int], entity_type: str = "campaign") -> str:
+    """
+    Summarize performance data (campaigns, ads, keywords) by showing:
+    1. Aggregate totals (ALL data preserved)
+    2. Top N detailed results
+    This ensures no data is lost while keeping output manageable.
+    """
+    if not rows:
+        return f"No {entity_type} data found."
+    
+    # Calculate aggregate totals from ALL rows (preserves all data)
+    total_impressions = 0
+    total_clicks = 0
+    total_cost = 0
+    total_conversions = 0
+    total_conversion_value = 0
+    
+    for row in rows:
+        metrics = row.get("metrics", {})
+        total_impressions += int(metrics.get("impressions", 0))
+        total_clicks += int(metrics.get("clicks", 0))
+        total_cost += int(metrics.get("costMicros", 0))
+        total_conversions += float(metrics.get("conversions", 0))
+        total_conversion_value += float(metrics.get("conversionValue", 0))
+    
+    # Calculate aggregates
+    avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
+    avg_cpc = (total_cost / total_clicks) if total_clicks > 0 else 0
+    cost_per_conv = (total_cost / total_conversions) if total_conversions > 0 else 0
+    
+    # Build summary header
+    lines = [
+        f"Performance Summary for {cid} ({entity_type.title()}s)",
+        "=" * 100,
+        f"Total {entity_type}s analyzed: {total}",
+        f"Showing detailed breakdown for top {min(max_shown or total, total)} {entity_type}s",
+        "",
+        "📊 AGGREGATE TOTALS (All Data):",
+        f"   Total Impressions: {total_impressions:,}",
+        f"   Total Clicks: {total_clicks:,}",
+        f"   Total Cost: ${total_cost / 1_000_000:,.2f}",
+        f"   Total Conversions: {total_conversions:,.2f}",
+        f"   Total Conversion Value: ${total_conversion_value:,.2f}",
+        f"   Average CTR: {avg_ctr:.2f}%",
+        f"   Average CPC: ${avg_cpc / 1_000_000:.2f}",
+        f"   Cost per Conversion: ${cost_per_conv / 1_000_000:.2f}",
+        "",
+        "🎯 TOP PERFORMERS (Detailed):",
+        "=" * 100
+    ]
+    
+    # Show detailed top results (limited for readability)
+    shown_rows = rows[:max_shown] if max_shown else rows
+    
+    for i, row in enumerate(shown_rows, 1):
+        # Extract entity name based on type
+        if entity_type == "campaign":
+            entity = row.get("campaign", {})
+            name = entity.get("name", "Unknown")
+            status = entity.get("status", "")
+        elif entity_type == "ad":
+            ad_data = row.get("adGroupAd", {}).get("ad", {})
+            campaign = row.get("campaign", {})
+            name = f"{campaign.get('name', 'Unknown')} / {ad_data.get('name', 'Unknown Ad')}"
+            status = row.get("adGroupAd", {}).get("status", "")
+        elif entity_type == "keyword":
+            keyword = row.get("adGroupCriterion", {}).get("keyword", {})
+            name = f"{keyword.get('text', 'Unknown')} ({keyword.get('matchType', '')})"
+            status = row.get("adGroupCriterion", {}).get("status", "")
+            quality_score = row.get("adGroupCriterion", {}).get("qualityInfo", {}).get("qualityScore", "N/A")
+        else:
+            name = "Unknown"
+            status = ""
+        
+        metrics = row.get("metrics", {})
+        impr = int(metrics.get("impressions", 0))
+        clicks = int(metrics.get("clicks", 0))
+        cost = int(metrics.get("costMicros", 0))
+        conv = float(metrics.get("conversions", 0))
+        ctr = float(metrics.get("ctr", 0)) * 100
+        cpc = int(metrics.get("averageCpc", 0))
+        
+        lines.append(f"\n{i}. {name}")
+        if status:
+            lines.append(f"   Status: {status}")
+        if entity_type == "keyword" and quality_score != "N/A":
+            lines.append(f"   Quality Score: {quality_score}")
+        lines.append(f"   Impressions: {impr:,} | Clicks: {clicks:,} | CTR: {ctr:.2f}%")
+        lines.append(f"   Cost: ${cost / 1_000_000:,.2f} | CPC: ${cpc / 1_000_000:.2f}")
+        lines.append(f"   Conversions: {conv:.2f}")
+    
+    if total > len(shown_rows):
+        lines.append(f"\n... and {total - len(shown_rows)} more {entity_type}s (included in aggregate totals above)")
+    
+    return "\n".join(lines)
+
+def _summarize_change_events(rows: List[Dict], cid: str, total: int, max_shown: Optional[int]) -> str:
+    """Summarize change events by grouping similar changes."""
+    from collections import defaultdict
+    
+    # Group by resource type, operation, and date
+    groups = defaultdict(lambda: {"count": 0, "users": set(), "fields": set(), "latest": None})
+    
+    for row in rows:
+        ce = row.get("changeEvent", {})
+        resource_type = ce.get("resourceType", "UNKNOWN")
+        operation = ce.get("resourceChangeOperation", "UNKNOWN")
+        date = ce.get("changeDateTime", "")[:10]  # Just the date part
+        user = ce.get("userEmail", "unknown")
+        changed_fields = ce.get("changedFields", "")
+        
+        key = (resource_type, operation, date)
+        groups[key]["count"] += 1
+        groups[key]["users"].add(user)
+        if changed_fields:
+            for field in changed_fields.split(","):
+                groups[key]["fields"].add(field.strip())
+        if not groups[key]["latest"] or date > groups[key]["latest"]:
+            groups[key]["latest"] = ce.get("changeDateTime", "")
+    
+    # Sort by count descending
+    sorted_groups = sorted(groups.items(), key=lambda x: x[1]["count"], reverse=True)
+    
+    lines = [
+        f"Change Event Summary for {cid}",
+        f"Total events: {total} (grouped into {len(sorted_groups)} categories)",
+        "=" * 90,
+        ""
+    ]
+    
+    for (resource_type, operation, date), info in sorted_groups[:50]:  # Show top 50 groups
+        users_list = list(info["users"])[:3]
+        users_str = ", ".join(users_list)
+        if len(info["users"]) > 3:
+            users_str += f" +{len(info['users']) - 3} more"
+        
+        fields_list = list(info["fields"])[:5]
+        fields_str = ", ".join(fields_list)
+        if len(info["fields"]) > 5:
+            fields_str += f" +{len(info['fields']) - 5} more"
+        
+        lines.append(f"📊 {resource_type} / {operation}")
+        lines.append(f"   Count: {info['count']} events on {date}")
+        lines.append(f"   Users: {users_str}")
+        if fields_str:
+            lines.append(f"   Fields: {fields_str}")
+        lines.append(f"   Latest: {info['latest']}")
+        lines.append("")
+    
+    if len(sorted_groups) > 50:
+        lines.append(f"... and {len(sorted_groups) - 50} more change categories")
+    
+    return "\n".join(lines)
+
 def _adjust_change_event_query(query: str) -> str:
     """
     Adjusts change_event queries to comply with Google Ads API restrictions:
@@ -935,11 +1114,12 @@ def _adjust_change_event_query(query: str) -> str:
 async def execute_gaql_query(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
+    max_results: Optional[int] = Field(default=100, description="Maximum number of results to return (default 100). Use 0 for unlimited"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID to use as login-customer-id override")
 ) -> str:
     """
     Execute a custom GAQL query against the specified customer (name or ID).
-    Fetches all pages (no artificial caps; only API limitations apply).
+    Returns up to max_results (default 100). Use run_gaql for more formatting options.
     """
     try:
         creds = get_credentials()
@@ -954,6 +1134,10 @@ async def execute_gaql_query(
         if not rows:
             return "No results found for the query."
 
+        total_results = len(rows)
+        if max_results and max_results > 0:
+            rows = rows[:max_results]
+
         first = rows[0]
         fields: List[str] = []
         for k, v in first.items():
@@ -963,7 +1147,10 @@ async def execute_gaql_query(
             else:
                 fields.append(k)
 
-        lines = [f"Query Results for Account {cid}:", "-" * 80]
+        lines = [f"Query Results for Account {cid}:"]
+        if max_results and max_results > 0 and total_results > max_results:
+            lines.append(f"(Showing {max_results} of {total_results} results - use max_results=0 for all or run_gaql for more options)")
+        lines.append("-" * 80)
         lines.append(" | ".join(fields))
         lines.append("-" * 80)
         for row in rows:
@@ -985,12 +1172,41 @@ async def execute_gaql_query(
 async def get_campaign_performance(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    max_results: int = Field(default=50, description="Max campaigns to show in detail (default 50). Aggregates include ALL campaigns"),
+    order_by: str = Field(default="cost", description="Sort by: 'cost', 'conversions', 'clicks', 'impressions', or 'name'"),
+    status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
+    format: str = Field(default="auto", description="'auto' (smart), 'summary' (aggregates+top N), 'table', 'compact', 'csv', 'json'"),
+    auto_summarize_threshold: int = Field(default=100, description="If format='auto', summarize when results > this (default 100)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
+    """
+    Get campaign performance with INTELLIGENT auto-summarization.
+    
+    format='auto' (default): Small datasets (≤100) → full table | Large datasets (>100) → summary
+    format='summary': Always show aggregates (ALL data) + top N details
+    
+    NO DATA LOST: Aggregates always include ALL campaigns, detailed view shows top N.
+    """
     if days in (7, 14, 30, 60, 90, 180):
         date_range = f"LAST_{days}_DAYS"
     else:
         date_range = "LAST_30_DAYS"
+
+    # Build WHERE clause
+    where_clauses = [f"segments.date DURING {date_range}"]
+    if status_filter.upper() != "ALL":
+        where_clauses.append(f"campaign.status = '{status_filter.upper()}'")
+    where_str = " AND ".join(where_clauses)
+
+    # Map order_by
+    order_map = {
+        "cost": "metrics.cost_micros DESC",
+        "conversions": "metrics.conversions DESC",
+        "clicks": "metrics.clicks DESC",
+        "impressions": "metrics.impressions DESC",
+        "name": "campaign.name ASC"
+    }
+    order_clause = order_map.get(order_by.lower(), "metrics.cost_micros DESC")
 
     query = f"""
         SELECT
@@ -1001,23 +1217,85 @@ async def get_campaign_performance(
             metrics.clicks,
             metrics.cost_micros,
             metrics.conversions,
-            metrics.average_cpc
+            metrics.conversion_value,
+            metrics.average_cpc,
+            metrics.ctr
         FROM campaign
-        WHERE segments.date DURING {date_range}
-        ORDER BY metrics.cost_micros DESC
+        WHERE {where_str}
+        ORDER BY {order_clause}
     """
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    
+    # Intelligent format selection
+    if format in ("auto", "summary"):
+        try:
+            creds = get_credentials()
+            cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+            headers = get_headers(creds, login_customer_id=login_customer_id)
+            
+            rows = _gaql_search_all(cid, query, headers)
+            if not rows:
+                return "No campaign performance data found."
+            
+            total_count = len(rows)
+            
+            # AUTO mode: decide based on data size
+            if format == "auto":
+                if total_count <= auto_summarize_threshold:
+                    logger.info(f"📊 Auto: {total_count} campaigns ≤ {auto_summarize_threshold}, showing full table")
+                    # Show full table
+                    return await run_gaql(customer_id, query + f" LIMIT {total_count}", "table", login_customer_id)
+                else:
+                    logger.info(f"📊 Auto: {total_count} campaigns > {auto_summarize_threshold}, using summary")
+                    return _summarize_performance_data(rows, cid, total_count, max_results, "campaign")
+            else:
+                # Explicit summary request
+                return _summarize_performance_data(rows, cid, total_count, max_results, "campaign")
+        except Exception as e:
+            return f"Error getting campaign performance: {str(e)}"
+    
+    # Other formats
+    return await run_gaql(customer_id, query + f" LIMIT {max_results}", format, login_customer_id)
 
 @mcp.tool()
 async def get_ad_performance(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    max_results: int = Field(default=50, description="Max ads to show in detail (default 50). Aggregates include ALL ads"),
+    order_by: str = Field(default="impressions", description="Sort by: 'impressions', 'clicks', 'conversions', 'cost', or 'ctr'"),
+    status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
+    format: str = Field(default="auto", description="'auto' (smart), 'summary' (aggregates+top N), 'table', 'compact', 'csv', 'json'"),
+    min_impressions: int = Field(default=0, description="Minimum impressions filter (default 0)"),
+    auto_summarize_threshold: int = Field(default=100, description="If format='auto', summarize when results > this (default 100)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
+    """
+    Get ad performance with INTELLIGENT auto-summarization.
+    
+    format='auto' (default): Small datasets (≤100) → full table | Large datasets (>100) → summary
+    NO DATA LOST: Aggregates always include ALL ads, detailed view shows top N.
+    """
     if days in (7, 14, 30, 60, 90, 180):
         date_range = f"LAST_{days}_DAYS"
     else:
         date_range = "LAST_30_DAYS"
+
+    # Build WHERE clause
+    where_clauses = [f"segments.date DURING {date_range}"]
+    if status_filter.upper() != "ALL":
+        where_clauses.append(f"ad_group_ad.status = '{status_filter.upper()}'")
+    if min_impressions > 0:
+        where_clauses.append(f"metrics.impressions >= {min_impressions}")
+    where_str = " AND ".join(where_clauses)
+
+    # Map order_by
+    order_map = {
+        "impressions": "metrics.impressions DESC",
+        "clicks": "metrics.clicks DESC",
+        "conversions": "metrics.conversions DESC",
+        "cost": "metrics.cost_micros DESC",
+        "ctr": "metrics.ctr DESC"
+    }
+    order_clause = order_map.get(order_by.lower(), "metrics.impressions DESC")
 
     query = f"""
         SELECT
@@ -1029,18 +1307,216 @@ async def get_ad_performance(
             metrics.impressions,
             metrics.clicks,
             metrics.cost_micros,
-            metrics.conversions
+            metrics.conversions,
+            metrics.conversion_value,
+            metrics.ctr,
+            metrics.average_cpc
         FROM ad_group_ad
-        WHERE segments.date DURING {date_range}
-        ORDER BY metrics.impressions DESC
+        WHERE {where_str}
+        ORDER BY {order_clause}
     """
-    return await execute_gaql_query(customer_id, query, login_customer_id)
+    
+    # Intelligent format selection
+    if format in ("auto", "summary"):
+        try:
+            creds = get_credentials()
+            cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+            headers = get_headers(creds, login_customer_id=login_customer_id)
+            
+            rows = _gaql_search_all(cid, query, headers)
+            if not rows:
+                return "No ad performance data found."
+            
+            total_count = len(rows)
+            
+            # AUTO mode
+            if format == "auto":
+                if total_count <= auto_summarize_threshold:
+                    logger.info(f"📊 Auto: {total_count} ads ≤ {auto_summarize_threshold}, showing full table")
+                    return await run_gaql(customer_id, query + f" LIMIT {total_count}", "table", login_customer_id)
+                else:
+                    logger.info(f"📊 Auto: {total_count} ads > {auto_summarize_threshold}, using summary")
+                    return _summarize_performance_data(rows, cid, total_count, max_results, "ad")
+            else:
+                return _summarize_performance_data(rows, cid, total_count, max_results, "ad")
+        except Exception as e:
+            return f"Error getting ad performance: {str(e)}"
+    
+    return await run_gaql(customer_id, query + f" LIMIT {max_results}", format, login_customer_id)
+
+@mcp.tool()
+async def get_keyword_performance(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    max_results: int = Field(default=50, description="Max keywords to show in detail (default 50). Aggregates include ALL keywords"),
+    order_by: str = Field(default="impressions", description="Sort by: 'impressions', 'clicks', 'conversions', 'cost', 'ctr', 'quality_score'"),
+    status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
+    match_type: Optional[str] = Field(default=None, description="Filter by match type: 'EXACT', 'PHRASE', 'BROAD', or None for all"),
+    format: str = Field(default="auto", description="'auto' (smart), 'summary' (aggregates+top N), 'table', 'compact', 'csv', 'json'"),
+    min_impressions: int = Field(default=10, description="Minimum impressions filter (default 10 to exclude low-volume keywords)"),
+    auto_summarize_threshold: int = Field(default=100, description="If format='auto', summarize when results > this (default 100)"),
+    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
+) -> str:
+    """
+    Get keyword performance with INTELLIGENT auto-summarization.
+    
+    format='auto' (default): Small datasets (≤100) → full table | Large datasets (>100) → summary
+    NO DATA LOST: Aggregates always include ALL keywords, detailed view shows top N.
+    Filters out keywords with <10 impressions by default.
+    """
+    if days in (7, 14, 30, 60, 90, 180):
+        date_range = f"LAST_{days}_DAYS"
+    else:
+        date_range = "LAST_30_DAYS"
+
+    # Build WHERE clause
+    where_clauses = [f"segments.date DURING {date_range}"]
+    if status_filter.upper() != "ALL":
+        where_clauses.append(f"ad_group_criterion.status = '{status_filter.upper()}'")
+    if match_type:
+        where_clauses.append(f"ad_group_criterion.keyword.match_type = '{match_type.upper()}'")
+    if min_impressions > 0:
+        where_clauses.append(f"metrics.impressions >= {min_impressions}")
+    where_str = " AND ".join(where_clauses)
+
+    # Map order_by
+    order_map = {
+        "impressions": "metrics.impressions DESC",
+        "clicks": "metrics.clicks DESC",
+        "conversions": "metrics.conversions DESC",
+        "cost": "metrics.cost_micros DESC",
+        "ctr": "metrics.ctr DESC",
+        "quality_score": "ad_group_criterion.quality_info.quality_score DESC"
+    }
+    order_clause = order_map.get(order_by.lower(), "metrics.impressions DESC")
+
+    query = f"""
+        SELECT
+            campaign.name,
+            ad_group.name,
+            ad_group_criterion.criterion_id,
+            ad_group_criterion.keyword.text,
+            ad_group_criterion.keyword.match_type,
+            ad_group_criterion.quality_info.quality_score,
+            ad_group_criterion.status,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.conversion_value,
+            metrics.ctr,
+            metrics.average_cpc,
+            metrics.search_impression_share
+        FROM keyword_view
+        WHERE {where_str}
+        ORDER BY {order_clause}
+    """
+    
+    # Intelligent format selection
+    if format in ("auto", "summary"):
+        try:
+            creds = get_credentials()
+            cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+            headers = get_headers(creds, login_customer_id=login_customer_id)
+            
+            rows = _gaql_search_all(cid, query, headers)
+            if not rows:
+                return "No keyword performance data found."
+            
+            total_count = len(rows)
+            
+            # AUTO mode
+            if format == "auto":
+                if total_count <= auto_summarize_threshold:
+                    logger.info(f"📊 Auto: {total_count} keywords ≤ {auto_summarize_threshold}, showing full table")
+                    return await run_gaql(customer_id, query + f" LIMIT {total_count}", "table", login_customer_id)
+                else:
+                    logger.info(f"📊 Auto: {total_count} keywords > {auto_summarize_threshold}, using summary")
+                    return _summarize_performance_data(rows, cid, total_count, max_results, "keyword")
+            else:
+                return _summarize_performance_data(rows, cid, total_count, max_results, "keyword")
+        except Exception as e:
+            return f"Error getting keyword performance: {str(e)}"
+    
+    return await run_gaql(customer_id, query + f" LIMIT {max_results}", format, login_customer_id)
+
+@mcp.tool()
+async def get_change_history(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    days: int = Field(default=7, description="Number of days to look back (max 29)"),
+    resource_type: Optional[str] = Field(default=None, description="Filter by resource type (e.g., 'CAMPAIGN', 'AD_GROUP', 'AD')"),
+    operation: Optional[str] = Field(default=None, description="Filter by operation (e.g., 'CREATE', 'UPDATE', 'REMOVE')"),
+    format: str = Field(default="summary", description="Output format: 'summary' (default), 'table', 'compact', or 'json'"),
+    max_results: int = Field(default=500, description="Maximum number of events to fetch (default 500)"),
+    max_detail: int = Field(default=50, description="Max events to show in detail if format=table/compact (default 50)"),
+    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
+) -> str:
+    """
+    Get change history for an account with smart summarization.
+    By default, returns a grouped summary to avoid overwhelming output.
+    Use format='table' for detailed view (not recommended for large result sets).
+    """
+    # Ensure days is within API limits (max 29)
+    if days > 29:
+        days = 29
+    
+    end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    
+    where_clauses = [
+        f"change_event.change_date_time BETWEEN '{start_date}' AND '{end_date}'"
+    ]
+    
+    if resource_type:
+        where_clauses.append(f"change_event.change_resource_type = '{resource_type.upper()}'")
+    
+    if operation:
+        where_clauses.append(f"change_event.resource_change_operation = '{operation.upper()}'")
+    
+    where_str = " AND ".join(where_clauses)
+    
+    query = f"""
+        SELECT
+            change_event.resource_name,
+            change_event.change_date_time,
+            change_event.change_resource_type,
+            change_event.user_email,
+            change_event.client_type,
+            change_event.resource_change_operation,
+            change_event.changed_fields
+        FROM change_event
+        WHERE {where_str}
+        ORDER BY change_event.change_date_time DESC
+        LIMIT {max_results}
+    """
+    
+    # For summary format, fetch data and summarize
+    if format == "summary":
+        try:
+            creds = get_credentials()
+            cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+            headers = get_headers(creds, login_customer_id=login_customer_id)
+            
+            adjusted_query = _adjust_change_event_query(query)
+            rows = _gaql_search_all(cid, adjusted_query, headers)
+            
+            if not rows:
+                return "No change events found."
+            
+            return _summarize_change_events(rows, cid, len(rows), max_detail)
+        except Exception as e:
+            return f"Error getting change history: {str(e)}"
+    
+    # For other formats, use run_gaql
+    return await run_gaql(customer_id, query, format, login_customer_id)
 
 @mcp.tool()
 async def run_gaql(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
-    format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'"),
+    format: str = Field(default="table", description="Output format: 'table', 'json', 'csv', 'compact', or 'summary'"),
+    max_results: Optional[int] = Field(default=None, description="Maximum number of results to return (truncates output). None = all results"),
+    fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include (e.g., 'id,name,status'). None = all fields"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     try:
@@ -1051,57 +1527,117 @@ async def run_gaql(
         # Auto-adjust change_event queries for API restrictions
         adjusted_query = _adjust_change_event_query(query)
 
-        # Fetch all rows with pagination (no artificial caps)
+        # Fetch all rows with pagination
         rows = _gaql_search_all(cid, adjusted_query, headers)
         if not rows:
             return "No results found for the query."
 
-        if format.lower() == "json":
-            return json.dumps({"results": rows}, indent=2)
-
+        # Apply max_results truncation if specified
+        total_results = len(rows)
+        if max_results and max_results > 0:
+            rows = rows[:max_results]
+        
+        # Extract all available fields from first row
         first = rows[0]
-        fields: List[str] = []
+        all_fields: List[str] = []
         for k, v in first.items():
             if isinstance(v, dict):
                 for sk in v:
-                    fields.append(f"{k}.{sk}")
+                    all_fields.append(f"{k}.{sk}")
             else:
-                fields.append(k)
+                all_fields.append(k)
+        
+        # Filter fields if specified
+        if fields:
+            requested_fields = [f.strip() for f in fields.split(",")]
+            selected_fields = []
+            for rf in requested_fields:
+                # Support partial matches (e.g., "name" matches "campaign.name", "ad.name", etc.)
+                matches = [af for af in all_fields if rf in af or af.endswith(f".{rf}") or af == rf]
+                selected_fields.extend(matches if matches else [rf])
+            # Remove duplicates while preserving order
+            seen = set()
+            filtered_fields = []
+            for f in selected_fields:
+                if f not in seen and f in all_fields:
+                    filtered_fields.append(f)
+                    seen.add(f)
+            if not filtered_fields:
+                filtered_fields = all_fields
+        else:
+            filtered_fields = all_fields
+
+        # Handle different output formats
+        if format.lower() == "summary" and "change_event" in query.lower():
+            # Special summarization for change events
+            return _summarize_change_events(rows, cid, total_results, max_results)
+        
+        if format.lower() == "compact":
+            # Compact format: minimal output, essential fields only
+            return _format_compact(rows, filtered_fields, cid, total_results, max_results)
+        
+        if format.lower() == "json":
+            # Filter JSON output to selected fields
+            filtered_rows = []
+            for row in rows:
+                filtered_row = {}
+                for f in filtered_fields:
+                    if "." in f:
+                        p, c = f.split(".", 1)
+                        if p in row and isinstance(row[p], dict):
+                            if p not in filtered_row:
+                                filtered_row[p] = {}
+                            if c in row[p]:
+                                filtered_row[p][c] = row[p][c]
+                    elif f in row:
+                        filtered_row[f] = row[f]
+                filtered_rows.append(filtered_row)
+            
+            result = {"results": filtered_rows}
+            if max_results and total_results > max_results:
+                result["note"] = f"Showing {max_results} of {total_results} results"
+            return json.dumps(result, indent=2)
 
         if format.lower() == "csv":
-            csv_lines = [",".join(fields)]
+            csv_lines = [",".join(filtered_fields)]
             for row in rows:
                 row_vals = []
-                for f in fields:
+                for f in filtered_fields:
                     if "." in f:
-                        p, c = f.split(".")
+                        p, c = f.split(".", 1)
                         val = str(row.get(p, {}).get(c, "")).replace(",", ";")
                     else:
                         val = str(row.get(f, "")).replace(",", ";")
                     row_vals.append(val)
                 csv_lines.append(",".join(row_vals))
+            if max_results and total_results > max_results:
+                csv_lines.append(f"# Note: Showing {max_results} of {total_results} results")
             return "\n".join(csv_lines)
 
-        # table
-        lines = [f"Query Results for Account {cid}:", "-" * 100]
-        widths = {f: len(f) for f in fields}
+        # table (default)
+        lines = [f"Query Results for Account {cid}:"]
+        if max_results and total_results > max_results:
+            lines.append(f"(Showing {max_results} of {total_results} results)")
+        lines.append("-" * 100)
+        
+        widths = {f: len(f) for f in filtered_fields}
         for row in rows:
-            for f in fields:
+            for f in filtered_fields:
                 if "." in f:
-                    p, c = f.split(".")
+                    p, c = f.split(".", 1)
                     v = str(row.get(p, {}).get(c, ""))
                 else:
                     v = str(row.get(f, ""))
                 widths[f] = max(widths[f], len(v))
 
-        header = " | ".join(f"{f:{widths[f]}}" for f in fields)
+        header = " | ".join(f"{f:{widths[f]}}" for f in filtered_fields)
         lines.append(header)
         lines.append("-" * len(header))
         for row in rows:
             vals = []
-            for f in fields:
+            for f in filtered_fields:
                 if "." in f:
-                    p, c = f.split(".")
+                    p, c = f.split(".", 1)
                     v = str(row.get(p, {}).get(c, ""))
                 else:
                     v = str(row.get(f, ""))
