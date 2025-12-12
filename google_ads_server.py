@@ -1433,6 +1433,137 @@ async def get_keyword_performance(
     )
 
 @mcp.tool()
+async def get_campaign_budgets(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    status_filter: str = Field(default="ALL", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
+    format: str = Field(default="summary", description="'summary' (default - aggregates+breakdown), 'table', 'json'"),
+    max_results: int = Field(default=50, description="Max campaigns to show in detail (default 50)"),
+    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
+) -> str:
+    """
+    Get campaign budget information with smart summarization.
+    
+    format='summary' (default): Shows total budgets, shared vs individual, by status breakdown.
+    NO DATA LOST: Aggregates include ALL campaigns.
+    """
+    # Build WHERE clause
+    where_clauses = []
+    if status_filter.upper() != "ALL":
+        where_clauses.append(f"campaign.status = '{status_filter.upper()}'")
+    where_str = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    query = f"""
+        SELECT
+            campaign.id,
+            campaign.name,
+            campaign.status,
+            campaign.bidding_strategy_type,
+            campaign_budget.amount_micros,
+            campaign_budget.explicitly_shared,
+            campaign_budget.resource_name
+        FROM campaign
+        {where_str}
+        ORDER BY campaign_budget.amount_micros DESC
+    """
+    
+    # For summary format, fetch ALL and summarize
+    if format == "summary":
+        try:
+            creds = get_credentials()
+            cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+            headers = get_headers(creds, login_customer_id=login_customer_id)
+            
+            rows = _gaql_search_all(cid, query, headers)
+            if not rows:
+                return "No campaign budget data found."
+            
+            # Aggregate totals
+            total_campaigns = len(rows)
+            total_budget = 0
+            shared_budget = 0
+            individual_budget = 0
+            by_status = {"ENABLED": 0, "PAUSED": 0, "REMOVED": 0}
+            shared_budgets = {}  # Track unique shared budgets
+            
+            for row in rows:
+                campaign = row.get("campaign", {})
+                budget = row.get("campaignBudget", {})
+                
+                amount = int(budget.get("amountMicros", 0))
+                is_shared = budget.get("explicitlyShared", False)
+                status = campaign.get("status", "UNKNOWN")
+                budget_resource = budget.get("resourceName", "")
+                
+                if is_shared:
+                    # Track shared budgets separately to avoid double counting
+                    if budget_resource not in shared_budgets:
+                        shared_budgets[budget_resource] = amount
+                        shared_budget += amount
+                else:
+                    individual_budget += amount
+                
+                if status in by_status:
+                    if is_shared and budget_resource not in [k for k, v in shared_budgets.items() if v == amount]:
+                        pass  # Don't count shared budget multiple times per status
+                    elif not is_shared:
+                        by_status[status] += amount
+            
+            total_budget = shared_budget + individual_budget
+            
+            lines = [
+                f"Campaign Budget Summary for {cid}",
+                "=" * 100,
+                f"Total campaigns: {total_campaigns}",
+                f"Showing detailed breakdown for top {min(max_results, total_campaigns)} campaigns",
+                "",
+                "💰 TOTAL BUDGET ALLOCATION:",
+                f"   Total Budget: ${total_budget / 1_000_000:,.2f}",
+                f"   Shared Budgets: ${shared_budget / 1_000_000:,.2f} ({len(shared_budgets)} unique)",
+                f"   Individual Budgets: ${individual_budget / 1_000_000:,.2f}",
+                "",
+                "📊 BUDGET BY STATUS:",
+                f"   ENABLED: ${by_status['ENABLED'] / 1_000_000:,.2f}",
+                f"   PAUSED: ${by_status['PAUSED'] / 1_000_000:,.2f}",
+                f"   REMOVED: ${by_status['REMOVED'] / 1_000_000:,.2f}",
+                "",
+                "🎯 TOP CAMPAIGNS BY BUDGET:",
+                "=" * 100
+            ]
+            
+            # Show top campaigns
+            for i, row in enumerate(rows[:max_results], 1):
+                campaign = row.get("campaign", {})
+                budget = row.get("campaignBudget", {})
+                
+                name = campaign.get("name", "Unknown")
+                status = campaign.get("status", "")
+                bidding = campaign.get("biddingStrategyType", "")
+                amount = int(budget.get("amountMicros", 0))
+                is_shared = budget.get("explicitlyShared", False)
+                
+                lines.append(f"\n{i}. {name}")
+                lines.append(f"   Status: {status} | Bidding: {bidding}")
+                lines.append(f"   Budget: ${amount / 1_000_000:,.2f} {'(Shared)' if is_shared else '(Individual)'}")
+            
+            if total_campaigns > max_results:
+                lines.append(f"\n... and {total_campaigns - max_results} more campaigns (included in totals above)")
+            
+            return "\n".join(lines)
+            
+        except Exception as e:
+            return f"Error getting campaign budgets: {str(e)}"
+    
+    # For other formats
+    return await run_gaql(
+        customer_id=customer_id,
+        query=query + f" LIMIT {max_results}",
+        format=format,
+        max_results=None,
+        fields=None,
+        login_customer_id=login_customer_id
+    )
+
+@mcp.tool()
 async def get_change_history(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     days: int = Field(default=7, description="Number of days to look back (max 29)"),
