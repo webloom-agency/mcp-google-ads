@@ -1243,7 +1243,12 @@ async def get_campaign_performance(
                 if total_count <= auto_summarize_threshold:
                     logger.info(f"📊 Auto: {total_count} campaigns ≤ {auto_summarize_threshold}, showing full table")
                     # Show full table
-                    return await run_gaql(customer_id, query + f" LIMIT {total_count}", "table", login_customer_id)
+                    return await run_gaql(
+                        customer_id=customer_id,
+                        query=query + f" LIMIT {total_count}",
+                        format="table",
+                        login_customer_id=login_customer_id
+                    )
                 else:
                     logger.info(f"📊 Auto: {total_count} campaigns > {auto_summarize_threshold}, using summary")
                     return _summarize_performance_data(rows, cid, total_count, max_results, "campaign")
@@ -1254,7 +1259,12 @@ async def get_campaign_performance(
             return f"Error getting campaign performance: {str(e)}"
     
     # Other formats
-    return await run_gaql(customer_id, query + f" LIMIT {max_results}", format, login_customer_id)
+    return await run_gaql(
+        customer_id=customer_id,
+        query=query + f" LIMIT {max_results}",
+        format=format,
+        login_customer_id=login_customer_id
+    )
 
 @mcp.tool()
 async def get_ad_performance(
@@ -1333,7 +1343,12 @@ async def get_ad_performance(
             if format == "auto":
                 if total_count <= auto_summarize_threshold:
                     logger.info(f"📊 Auto: {total_count} ads ≤ {auto_summarize_threshold}, showing full table")
-                    return await run_gaql(customer_id, query + f" LIMIT {total_count}", "table", login_customer_id)
+                    return await run_gaql(
+                        customer_id=customer_id,
+                        query=query + f" LIMIT {total_count}",
+                        format="table",
+                        login_customer_id=login_customer_id
+                    )
                 else:
                     logger.info(f"📊 Auto: {total_count} ads > {auto_summarize_threshold}, using summary")
                     return _summarize_performance_data(rows, cid, total_count, max_results, "ad")
@@ -1342,7 +1357,12 @@ async def get_ad_performance(
         except Exception as e:
             return f"Error getting ad performance: {str(e)}"
     
-    return await run_gaql(customer_id, query + f" LIMIT {max_results}", format, login_customer_id)
+    return await run_gaql(
+        customer_id=customer_id,
+        query=query + f" LIMIT {max_results}",
+        format=format,
+        login_customer_id=login_customer_id
+    )
 
 @mcp.tool()
 async def get_keyword_performance(
@@ -1429,7 +1449,12 @@ async def get_keyword_performance(
             if format == "auto":
                 if total_count <= auto_summarize_threshold:
                     logger.info(f"📊 Auto: {total_count} keywords ≤ {auto_summarize_threshold}, showing full table")
-                    return await run_gaql(customer_id, query + f" LIMIT {total_count}", "table", login_customer_id)
+                    return await run_gaql(
+                        customer_id=customer_id,
+                        query=query + f" LIMIT {total_count}",
+                        format="table",
+                        login_customer_id=login_customer_id
+                    )
                 else:
                     logger.info(f"📊 Auto: {total_count} keywords > {auto_summarize_threshold}, using summary")
                     return _summarize_performance_data(rows, cid, total_count, max_results, "keyword")
@@ -1438,7 +1463,12 @@ async def get_keyword_performance(
         except Exception as e:
             return f"Error getting keyword performance: {str(e)}"
     
-    return await run_gaql(customer_id, query + f" LIMIT {max_results}", format, login_customer_id)
+    return await run_gaql(
+        customer_id=customer_id,
+        query=query + f" LIMIT {max_results}",
+        format=format,
+        login_customer_id=login_customer_id
+    )
 
 @mcp.tool()
 async def get_change_history(
@@ -1508,7 +1538,12 @@ async def get_change_history(
             return f"Error getting change history: {str(e)}"
     
     # For other formats, use run_gaql
-    return await run_gaql(customer_id, query, format, login_customer_id)
+    return await run_gaql(
+        customer_id=customer_id,
+        query=query,
+        format=format,
+        login_customer_id=login_customer_id
+    )
 
 @mcp.tool()
 async def run_gaql(
