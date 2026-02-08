@@ -744,6 +744,8 @@ async def find_account(
 ) -> str:
     """
     Fuzzy-search accounts by name or normalize an ID (using full hierarchy index).
+    Results are sorted so Client accounts appear before MCC/manager accounts
+    (at equal relevance), because metrics queries only work on client accounts.
     """
     try:
         rows = []
@@ -757,11 +759,19 @@ async def find_account(
                 nm = a.get("name") or ""
                 score = difflib.SequenceMatcher(None, query.lower(), nm.lower()).ratio()
                 scored.append((score, a))
-            scored.sort(key=lambda x: x[0], reverse=True)
+            # Sort by score DESC, then prefer non-manager (Client) over manager (MCC)
+            scored.sort(key=lambda x: (-x[0], x[1].get("manager", False) is True))
             rows = [a for _, a in scored[:top_k]]
 
         if not rows:
             return "No matches."
+
+        # Final sort: Client accounts first, then MCC, preserving relevance within each group
+        # (stable sort keeps original relevance order within each group)
+        has_clients = any(not a.get("manager") for a in rows)
+        if has_clients:
+            rows.sort(key=lambda a: (1 if a.get("manager") else 0))
+
         out = []
         for a in rows[:top_k]:
             tag = "MCC" if a["manager"] else "Client"
