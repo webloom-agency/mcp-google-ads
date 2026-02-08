@@ -1723,31 +1723,34 @@ SEARCH_TERMS_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_TERMS_CACHE_TTL_SECONDS",
 async def get_search_terms(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
-    page: int = Field(default=1, description="Page number (1-based). Use page=1 to fetch data from API and cache it. Subsequent pages read from cache."),
-    page_size: int = Field(default=50, description="Number of search terms per page (default 50, max 500)"),
+    max_results: int = Field(default=0, description="Max search terms to return. 0 = ALL (no limit). For summary format, controls how many detailed rows are shown."),
     order_by: str = Field(default="cost", description="Sort by: 'cost', 'clicks', 'conversions', 'impressions'"),
     status_filter: Optional[str] = Field(default=None, description="Filter by status: 'ADDED', 'EXCLUDED', 'NONE', or None for all"),
-    format: str = Field(default="summary", description="'summary' (default - aggregates+page of rows), 'json' (flat rows for export)"),
-    min_impressions: int = Field(default=10, description="Minimum impressions filter (default 10)"),
+    format: str = Field(default="json", description="'json' (default - all rows as flat JSON for export), 'summary' (aggregates + top N detailed rows)"),
+    min_impressions: int = Field(default=0, description="Minimum impressions filter (default 0)"),
     min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
-    Get search terms report with server-side pagination for large accounts.
+    Get search terms report — returns ALL matching rows in a single response.
     
-    PAGINATION: Data is fetched from Google Ads API on the FIRST call and cached (10 min TTL).
-    Subsequent page requests read from cache — no extra API calls.
+    Fetches all search terms from Google Ads API (handles API pagination internally),
+    then returns everything at once. Results are cached for 10 minutes so repeated
+    calls with the same parameters are instant.
     
-    Workflow for large accounts:
-      1. Call with page=1 → fetches ALL data, caches it, returns summary + first page
-      2. Call with page=2, page=3, ... → reads from cache, returns next pages
-      3. Use format='json' for machine-readable rows (ideal for Sheets export)
+    format='json' (default): Returns ALL rows as flat JSON with pre-computed metrics
+    (cost, CPA, ROAS, conv_rate). Ideal for bulk export to Google Sheets.
+    Each row includes: search_term, status, campaign, channel_type, ad_group,
+    impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value,
+    conv_rate, cpa, roas.
     
-    Response always includes: total_rows, total_pages, current_page so the caller knows when to stop.
+    format='summary': Human-readable report with aggregate totals + top N rows.
+    Use max_results to control how many detailed rows appear (0 = show all).
+    
+    Typical usage for large accounts:
+      get_search_terms(customer_id="...", days=14, min_cost=1.0, format="json")
+      → Returns ALL search terms with >= 1 EUR spend in last 14 days as JSON.
     """
-    page_size = min(max(page_size, 1), 500)  # clamp 1..500
-    page = max(page, 1)
-
     try:
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
     except Exception as e:
@@ -1781,36 +1784,17 @@ async def get_search_terms(
         except Exception as e:
             return f"Error getting search terms: {str(e)}"
 
-    # --- Pagination math ---
     total_rows = len(rows)
-    total_pages = max(1, (total_rows + page_size - 1) // page_size)
-    page = min(page, total_pages)
-    start_idx = (page - 1) * page_size
-    end_idx = min(start_idx + page_size, total_rows)
-    page_rows = rows[start_idx:end_idx]
 
-    pagination_info = (
-        f"Page {page}/{total_pages} | Rows {start_idx + 1}-{end_idx} of {total_rows} | "
-        f"Page size: {page_size}"
-    )
-
-    # --- JSON format (for export / Sheets) ---
+    # --- JSON format: return ALL rows in one shot ---
     if format == "json":
+        output_rows = rows if (max_results <= 0) else rows[:max_results]
+
+        t = summary["totals"]
         result = {
-            "pagination": {
-                "current_page": page,
-                "total_pages": total_pages,
-                "page_size": page_size,
-                "total_rows": total_rows,
-                "start_row": start_idx + 1,
-                "end_row": end_idx,
-            },
-            "rows": [_format_search_term_json(r) for r in page_rows],
-        }
-        # Include summary only on page 1
-        if page == 1:
-            t = summary["totals"]
-            result["summary"] = {
+            "total_rows": total_rows,
+            "returned_rows": len(output_rows),
+            "summary": {
                 "total_search_terms": total_rows,
                 "total_impressions": t["impr"],
                 "total_clicks": t["clicks"],
@@ -1830,76 +1814,62 @@ async def get_search_terms(
                     }
                     for s, d in summary["by_status"].items() if d["count"] > 0
                 },
-            }
+            },
+            "rows": [_format_search_term_json(r) for r in output_rows],
+        }
         return json.dumps(result, ensure_ascii=False)
 
     # --- Summary format (human-readable) ---
-    lines: List[str] = []
+    t = summary["totals"]
+    avg_ctr = (t["clicks"] / t["impr"] * 100) if t["impr"] > 0 else 0
+    avg_cpc = (t["cost"] / t["clicks"]) if t["clicks"] > 0 else 0
+    roas = (t["conv_value"] / (t["cost"] / 1_000_000)) if t["cost"] > 0 else 0
+    cpa = ((t["cost"] / 1_000_000) / t["conv"]) if t["conv"] > 0 else 0
 
-    # Include aggregate summary on page 1
-    if page == 1:
-        t = summary["totals"]
-        avg_ctr = (t["clicks"] / t["impr"] * 100) if t["impr"] > 0 else 0
-        avg_cpc = (t["cost"] / t["clicks"]) if t["clicks"] > 0 else 0
-        roas = (t["conv_value"] / (t["cost"] / 1_000_000)) if t["cost"] > 0 else 0
-        cpa = ((t["cost"] / 1_000_000) / t["conv"]) if t["conv"] > 0 else 0
+    lines: List[str] = [
+        f"Search Terms Report for {cid}",
+        "=" * 100,
+        f"Total search terms: {total_rows:,}",
+        "",
+        "📊 AGGREGATE TOTALS (All Search Terms):",
+        f"   Total Search Terms: {total_rows:,}",
+        f"   Total Impressions: {t['impr']:,}",
+        f"   Total Clicks: {t['clicks']:,}",
+        f"   Total Cost: ${t['cost'] / 1_000_000:,.2f}",
+        f"   Total Conversions: {t['conv']:,.2f}",
+        f"   Total Conversion Value: ${t['conv_value']:,.2f}",
+        f"   Average CTR: {avg_ctr:.2f}%",
+        f"   Average CPC: ${avg_cpc / 1_000_000:.2f}",
+        f"   ROAS: {roas:.2f}x",
+        f"   CPA: ${cpa:.2f}",
+        "",
+        "🏷️  BY STATUS:",
+        ""
+    ]
 
-        lines.extend([
-            f"Search Terms Report for {cid}",
-            "=" * 100,
-            pagination_info,
-            "",
-            "📊 AGGREGATE TOTALS (All Search Terms):",
-            f"   Total Search Terms: {total_rows:,}",
-            f"   Total Impressions: {t['impr']:,}",
-            f"   Total Clicks: {t['clicks']:,}",
-            f"   Total Cost: ${t['cost'] / 1_000_000:,.2f}",
-            f"   Total Conversions: {t['conv']:,.2f}",
-            f"   Total Conversion Value: ${t['conv_value']:,.2f}",
-            f"   Average CTR: {avg_ctr:.2f}%",
-            f"   Average CPC: ${avg_cpc / 1_000_000:.2f}",
-            f"   ROAS: {roas:.2f}x",
-            f"   CPA: ${cpa:.2f}",
-            "",
-            "🏷️  BY STATUS:",
-            ""
-        ])
+    for status, data in summary["by_status"].items():
+        if data["count"] > 0:
+            status_ctr = (data["clicks"] / data["impr"] * 100) if data["impr"] > 0 else 0
+            status_roas = (data["conv_value"] / (data["cost"] / 1_000_000)) if data["cost"] > 0 else 0
+            status_cpa = ((data["cost"] / 1_000_000) / data["conv"]) if data["conv"] > 0 else 0
+            lines.append(f"   {status} ({int(data['count'])} terms):")
+            lines.append(f"      Impressions: {int(data['impr']):,} | Clicks: {int(data['clicks']):,} | CTR: {status_ctr:.2f}%")
+            lines.append(f"      Cost: ${data['cost'] / 1_000_000:,.2f} | Conversions: {data['conv']:,.2f} | Conv. Value: ${data['conv_value']:,.2f}")
+            lines.append(f"      ROAS: {status_roas:.2f}x | CPA: ${status_cpa:.2f}")
+            lines.append("")
 
-        for status, data in summary["by_status"].items():
-            if data["count"] > 0:
-                status_ctr = (data["clicks"] / data["impr"] * 100) if data["impr"] > 0 else 0
-                status_roas = (data["conv_value"] / (data["cost"] / 1_000_000)) if data["cost"] > 0 else 0
-                status_cpa = ((data["cost"] / 1_000_000) / data["conv"]) if data["conv"] > 0 else 0
-                lines.append(f"   {status} ({int(data['count'])} terms):")
-                lines.append(f"      Impressions: {int(data['impr']):,} | Clicks: {int(data['clicks']):,} | CTR: {status_ctr:.2f}%")
-                lines.append(f"      Cost: ${data['cost'] / 1_000_000:,.2f} | Conversions: {data['conv']:,.2f} | Conv. Value: ${data['conv_value']:,.2f}")
-                lines.append(f"      ROAS: {status_roas:.2f}x | CPA: ${status_cpa:.2f}")
-                lines.append("")
+    lines.extend([
+        "🎯 SEARCH TERMS (Detailed):",
+        "=" * 100
+    ])
 
-        lines.extend([
-            "🎯 SEARCH TERMS (Detailed):",
-            "=" * 100
-        ])
-    else:
-        lines.extend([
-            f"Search Terms Report for {cid} (continued)",
-            "=" * 100,
-            pagination_info,
-            "",
-        ])
+    # Show detailed rows (all or top N)
+    display_rows = rows if (max_results <= 0) else rows[:max_results]
+    for i, row in enumerate(display_rows):
+        lines.append(_format_search_term_row(row, i + 1))
 
-    # Render page rows
-    for i, row in enumerate(page_rows):
-        lines.append(_format_search_term_row(row, start_idx + i + 1))
-
-    # Pagination footer
-    lines.append("")
-    lines.append("-" * 100)
-    lines.append(pagination_info)
-    if page < total_pages:
-        lines.append(f"➡️  Call again with page={page + 1} to get the next {min(page_size, total_rows - end_idx)} search terms.")
-    else:
-        lines.append("✅ This is the last page.")
+    if max_results > 0 and total_rows > max_results:
+        lines.append(f"\n... and {total_rows - max_results} more search terms (included in aggregate totals above)")
 
     return "\n".join(lines)
 
