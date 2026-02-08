@@ -1572,6 +1572,7 @@ async def get_search_terms(
     status_filter: Optional[str] = Field(default=None, description="Filter by status: 'ADDED', 'EXCLUDED', 'NONE', or None for all"),
     format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'json'"),
     min_impressions: int = Field(default=10, description="Minimum impressions filter (default 10)"),
+    min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
@@ -1592,6 +1593,9 @@ async def get_search_terms(
     ]
     if min_impressions > 0:
         where_clauses.append(f"metrics.impressions >= {min_impressions}")
+    if min_cost > 0:
+        min_cost_micros = int(min_cost * 1_000_000)
+        where_clauses.append(f"metrics.cost_micros >= {min_cost_micros}")
     if status_filter:
         where_clauses.append(f"search_term_view.status = '{status_filter.upper()}'")
     where_str = " AND ".join(where_clauses)
@@ -1608,6 +1612,7 @@ async def get_search_terms(
     query = f"""
         SELECT
             campaign.name,
+            campaign.advertising_channel_type,
             ad_group.name,
             search_term_view.search_term,
             search_term_view.status,
@@ -1616,7 +1621,8 @@ async def get_search_terms(
             metrics.ctr,
             metrics.average_cpc,
             metrics.cost_micros,
-            metrics.conversions
+            metrics.conversions,
+            metrics.conversions_value
         FROM search_term_view
         WHERE {where_str}
         ORDER BY {order_clause}
@@ -1636,14 +1642,15 @@ async def get_search_terms(
             total_count = len(rows)
             
             # Aggregate by status
-            by_status = {"ADDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0},
-                        "EXCLUDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0},
-                        "NONE": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0}}
+            by_status = {"ADDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
+                        "EXCLUDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
+                        "NONE": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0}}
             
             total_clicks = 0
             total_impressions = 0
             total_cost = 0
             total_conversions = 0
+            total_conv_value = 0
             
             for row in rows:
                 stv = row.get("searchTermView", {})
@@ -1654,6 +1661,7 @@ async def get_search_terms(
                 impr = int(metrics.get("impressions", 0))
                 cost = int(metrics.get("costMicros", 0))
                 conv = float(metrics.get("conversions", 0))
+                conv_value = float(metrics.get("conversionsValue", 0))
                 
                 if status in by_status:
                     by_status[status]["count"] += 1
@@ -1661,14 +1669,18 @@ async def get_search_terms(
                     by_status[status]["impr"] += impr
                     by_status[status]["cost"] += cost
                     by_status[status]["conv"] += conv
+                    by_status[status]["conv_value"] += conv_value
                 
                 total_clicks += clicks
                 total_impressions += impr
                 total_cost += cost
                 total_conversions += conv
+                total_conv_value += conv_value
             
             avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
             avg_cpc = (total_cost / total_clicks) if total_clicks > 0 else 0
+            roas = (total_conv_value / (total_cost / 1_000_000)) if total_cost > 0 else 0
+            cpa = ((total_cost / 1_000_000) / total_conversions) if total_conversions > 0 else 0
             
             lines = [
                 f"Search Terms Summary for {cid}",
@@ -1681,8 +1693,11 @@ async def get_search_terms(
                 f"   Total Clicks: {total_clicks:,}",
                 f"   Total Cost: ${total_cost / 1_000_000:,.2f}",
                 f"   Total Conversions: {total_conversions:,.2f}",
+                f"   Total Conversion Value: ${total_conv_value:,.2f}",
                 f"   Average CTR: {avg_ctr:.2f}%",
                 f"   Average CPC: ${avg_cpc / 1_000_000:.2f}",
+                f"   ROAS: {roas:.2f}x",
+                f"   CPA: ${cpa:.2f}",
                 "",
                 "🏷️  BY STATUS:",
                 ""
@@ -1691,9 +1706,12 @@ async def get_search_terms(
             for status, data in by_status.items():
                 if data["count"] > 0:
                     status_ctr = (data["clicks"] / data["impr"] * 100) if data["impr"] > 0 else 0
+                    status_roas = (data["conv_value"] / (data["cost"] / 1_000_000)) if data["cost"] > 0 else 0
+                    status_cpa = ((data["cost"] / 1_000_000) / data["conv"]) if data["conv"] > 0 else 0
                     lines.append(f"   {status} ({data['count']} terms):")
                     lines.append(f"      Impressions: {data['impr']:,} | Clicks: {data['clicks']:,} | CTR: {status_ctr:.2f}%")
-                    lines.append(f"      Cost: ${data['cost'] / 1_000_000:,.2f} | Conversions: {data['conv']:,.2f}")
+                    lines.append(f"      Cost: ${data['cost'] / 1_000_000:,.2f} | Conversions: {data['conv']:,.2f} | Conv. Value: ${data['conv_value']:,.2f}")
+                    lines.append(f"      ROAS: {status_roas:.2f}x | CPA: ${status_cpa:.2f}")
                     lines.append("")
             
             lines.extend([
@@ -1710,17 +1728,22 @@ async def get_search_terms(
                 
                 term = stv.get("searchTerm", "(no term)")
                 status = stv.get("status", "NONE")
+                channel_type = campaign.get("advertisingChannelType", "UNKNOWN")
                 clicks = int(metrics.get("clicks", 0))
                 impr = int(metrics.get("impressions", 0))
                 cost = int(metrics.get("costMicros", 0))
                 conv = float(metrics.get("conversions", 0))
+                conv_value = float(metrics.get("conversionsValue", 0))
                 ctr = float(metrics.get("ctr", 0)) * 100
                 cpc = int(metrics.get("averageCpc", 0))
+                term_roas = (conv_value / (cost / 1_000_000)) if cost > 0 else 0
+                term_cpa = ((cost / 1_000_000) / conv) if conv > 0 else 0
                 
                 lines.append(f"\n{i}. \"{term}\" [{status}]")
-                lines.append(f"   Campaign: {campaign.get('name', 'Unknown')}")
+                lines.append(f"   Campaign: {campaign.get('name', 'Unknown')} ({channel_type})")
                 lines.append(f"   Impressions: {impr:,} | Clicks: {clicks:,} | CTR: {ctr:.2f}%")
-                lines.append(f"   Cost: ${cost / 1_000_000:,.2f} | CPC: ${cpc / 1_000_000:.2f} | Conversions: {conv:.2f}")
+                lines.append(f"   Cost: ${cost / 1_000_000:,.2f} | CPC: ${cpc / 1_000_000:.2f} | Conversions: {conv:.2f} | Conv. Value: ${conv_value:.2f}")
+                lines.append(f"   ROAS: {term_roas:.2f}x | CPA: ${term_cpa:.2f}")
             
             if total_count > max_results:
                 lines.append(f"\n... and {total_count - max_results} more search terms (included in aggregate totals above)")
