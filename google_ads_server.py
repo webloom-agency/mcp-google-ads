@@ -157,6 +157,7 @@ USE_HIERARCHY_LOOKUP = os.getenv("USE_HIERARCHY_LOOKUP", "1") not in ("0", "fals
 
 _accounts_cache: Dict[str, Any] = {"at": 0, "items": []}     # listAccessibleCustomers-based (fallback)
 _hierarchy_cache: Dict[str, Any] = {"at": 0, "items": []}    # customer_client-based (full subtree)
+_search_terms_cache: Dict[str, Any] = {}                     # search terms paginated cache: {cache_key: {"at": int, "rows": [...], "summary": {...}}}
 
 # ----------------------------- HELPERS -----------------------------
 def _now_s() -> int:
@@ -1563,30 +1564,20 @@ async def get_campaign_budgets(
         login_customer_id=login_customer_id
     )
 
-@mcp.tool()
-async def get_search_terms(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
-    max_results: int = Field(default=50, description="Max search terms to show in detail (default 50)"),
-    order_by: str = Field(default="cost", description="Sort by: 'cost', 'clicks', 'conversions', 'impressions'"),
-    status_filter: Optional[str] = Field(default=None, description="Filter by status: 'ADDED', 'EXCLUDED', 'NONE', or None for all"),
-    format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'json'"),
-    min_impressions: int = Field(default=10, description="Minimum impressions filter (default 10)"),
-    min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
-    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
-) -> str:
-    """
-    Get search terms report with smart summarization.
-    
-    format='summary' (default): Shows aggregate totals for ALL search terms + top N by cost/conversions.
-    Groups by status (ADDED, EXCLUDED, NONE). NO DATA LOST in aggregates.
-    """
+def _search_terms_cache_key(cid: str, days: int, order_by: str, status_filter: Optional[str],
+                             min_impressions: int, min_cost: float) -> str:
+    """Build a deterministic cache key for search terms queries."""
+    return f"{cid}|{days}|{order_by}|{status_filter or 'ALL'}|mi{min_impressions}|mc{min_cost}"
+
+
+def _build_search_terms_query(days: int, order_by: str, status_filter: Optional[str],
+                               min_impressions: int, min_cost: float) -> str:
+    """Build the GAQL query for search terms."""
     if days in (7, 14, 30, 60, 90, 180):
         date_range = f"LAST_{days}_DAYS"
     else:
         date_range = "LAST_30_DAYS"
 
-    # Build WHERE clause
     where_clauses = [
         f"segments.date DURING {date_range}",
         "campaign.status = 'ENABLED'"
@@ -1598,9 +1589,7 @@ async def get_search_terms(
         where_clauses.append(f"metrics.cost_micros >= {min_cost_micros}")
     if status_filter:
         where_clauses.append(f"search_term_view.status = '{status_filter.upper()}'")
-    where_str = " AND ".join(where_clauses)
 
-    # Map order_by
     order_map = {
         "cost": "metrics.cost_micros DESC",
         "clicks": "metrics.clicks DESC",
@@ -1609,7 +1598,7 @@ async def get_search_terms(
     }
     order_clause = order_map.get(order_by.lower(), "metrics.cost_micros DESC")
 
-    query = f"""
+    return f"""
         SELECT
             campaign.name,
             campaign.advertising_channel_type,
@@ -1624,144 +1613,295 @@ async def get_search_terms(
             metrics.conversions,
             metrics.conversions_value
         FROM search_term_view
-        WHERE {where_str}
+        WHERE {" AND ".join(where_clauses)}
         ORDER BY {order_clause}
     """
+
+
+def _compute_search_terms_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute aggregate summary over all search term rows. Computed once, cached."""
+    by_status: Dict[str, Dict[str, float]] = {
+        "ADDED":    {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
+        "EXCLUDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
+        "NONE":     {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
+    }
+    totals = {"clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0}
+
+    for row in rows:
+        stv = row.get("searchTermView", {})
+        m = row.get("metrics", {})
+        status = stv.get("status", "NONE")
+        clicks = int(m.get("clicks", 0))
+        impr = int(m.get("impressions", 0))
+        cost = int(m.get("costMicros", 0))
+        conv = float(m.get("conversions", 0))
+        conv_value = float(m.get("conversionsValue", 0))
+
+        bucket = by_status.get(status, by_status["NONE"])
+        bucket["count"] += 1
+        bucket["clicks"] += clicks
+        bucket["impr"] += impr
+        bucket["cost"] += cost
+        bucket["conv"] += conv
+        bucket["conv_value"] += conv_value
+
+        totals["clicks"] += clicks
+        totals["impr"] += impr
+        totals["cost"] += cost
+        totals["conv"] += conv
+        totals["conv_value"] += conv_value
+
+    return {"total_count": len(rows), "totals": totals, "by_status": by_status}
+
+
+def _format_search_term_row(row: Dict[str, Any], index: int) -> str:
+    """Format a single search term row for text output."""
+    stv = row.get("searchTermView", {})
+    campaign = row.get("campaign", {})
+    ad_group = row.get("adGroup", {})
+    m = row.get("metrics", {})
+
+    term = stv.get("searchTerm", "(no term)")
+    status = stv.get("status", "NONE")
+    channel_type = campaign.get("advertisingChannelType", "UNKNOWN")
+    clicks = int(m.get("clicks", 0))
+    impr = int(m.get("impressions", 0))
+    cost = int(m.get("costMicros", 0))
+    conv = float(m.get("conversions", 0))
+    conv_value = float(m.get("conversionsValue", 0))
+    ctr = float(m.get("ctr", 0)) * 100
+    cpc = int(m.get("averageCpc", 0))
+    term_roas = (conv_value / (cost / 1_000_000)) if cost > 0 else 0
+    term_cpa = ((cost / 1_000_000) / conv) if conv > 0 else 0
+    conv_rate = (conv / clicks * 100) if clicks > 0 else 0
+
+    lines = [
+        f"\n{index}. \"{term}\" [{status}]",
+        f"   Campaign: {campaign.get('name', 'Unknown')} ({channel_type}) | Ad Group: {ad_group.get('name', 'Unknown')}",
+        f"   Impressions: {impr:,} | Clicks: {clicks:,} | CTR: {ctr:.2f}%",
+        f"   Cost: ${cost / 1_000_000:,.2f} | CPC: ${cpc / 1_000_000:.2f} | Conversions: {conv:.2f} | Conv. Value: ${conv_value:.2f}",
+        f"   Conv. Rate: {conv_rate:.2f}% | ROAS: {term_roas:.2f}x | CPA: ${term_cpa:.2f}",
+    ]
+    return "\n".join(lines)
+
+
+def _format_search_term_json(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a single search term row into a clean dict for JSON output."""
+    stv = row.get("searchTermView", {})
+    campaign = row.get("campaign", {})
+    ad_group = row.get("adGroup", {})
+    m = row.get("metrics", {})
+
+    cost = int(m.get("costMicros", 0))
+    conv = float(m.get("conversions", 0))
+    conv_value = float(m.get("conversionsValue", 0))
+    clicks = int(m.get("clicks", 0))
+
+    return {
+        "search_term": stv.get("searchTerm", ""),
+        "status": stv.get("status", "NONE"),
+        "campaign": campaign.get("name", ""),
+        "channel_type": campaign.get("advertisingChannelType", "UNKNOWN"),
+        "ad_group": ad_group.get("name", ""),
+        "impressions": int(m.get("impressions", 0)),
+        "clicks": clicks,
+        "ctr": round(float(m.get("ctr", 0)) * 100, 2),
+        "avg_cpc": round(int(m.get("averageCpc", 0)) / 1_000_000, 2),
+        "cost": round(cost / 1_000_000, 2),
+        "conversions": conv,
+        "conversions_value": conv_value,
+        "conv_rate": round((conv / clicks * 100) if clicks > 0 else 0, 2),
+        "cpa": round(((cost / 1_000_000) / conv) if conv > 0 else 0, 2),
+        "roas": round((conv_value / (cost / 1_000_000)) if cost > 0 else 0, 2),
+    }
+
+
+SEARCH_TERMS_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_TERMS_CACHE_TTL_SECONDS", "600"))  # 10 min default
+
+
+@mcp.tool()
+async def get_search_terms(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    page: int = Field(default=1, description="Page number (1-based). Use page=1 to fetch data from API and cache it. Subsequent pages read from cache."),
+    page_size: int = Field(default=50, description="Number of search terms per page (default 50, max 500)"),
+    order_by: str = Field(default="cost", description="Sort by: 'cost', 'clicks', 'conversions', 'impressions'"),
+    status_filter: Optional[str] = Field(default=None, description="Filter by status: 'ADDED', 'EXCLUDED', 'NONE', or None for all"),
+    format: str = Field(default="summary", description="'summary' (default - aggregates+page of rows), 'json' (flat rows for export)"),
+    min_impressions: int = Field(default=10, description="Minimum impressions filter (default 10)"),
+    min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
+    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
+) -> str:
+    """
+    Get search terms report with server-side pagination for large accounts.
     
-    # For summary format, fetch ALL and summarize
-    if format == "summary":
+    PAGINATION: Data is fetched from Google Ads API on the FIRST call and cached (10 min TTL).
+    Subsequent page requests read from cache — no extra API calls.
+    
+    Workflow for large accounts:
+      1. Call with page=1 → fetches ALL data, caches it, returns summary + first page
+      2. Call with page=2, page=3, ... → reads from cache, returns next pages
+      3. Use format='json' for machine-readable rows (ideal for Sheets export)
+    
+    Response always includes: total_rows, total_pages, current_page so the caller knows when to stop.
+    """
+    page_size = min(max(page_size, 1), 500)  # clamp 1..500
+    page = max(page, 1)
+
+    try:
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+    except Exception as e:
+        return f"Error resolving customer ID: {str(e)}"
+
+    cache_key = _search_terms_cache_key(cid, days, order_by, status_filter, min_impressions, min_cost)
+
+    # --- Check cache ---
+    cached = _search_terms_cache.get(cache_key)
+    if cached and (_now_s() - cached["at"] < SEARCH_TERMS_CACHE_TTL_SECONDS):
+        rows = cached["rows"]
+        summary = cached["summary"]
+        logger.info(f"📦 Search terms cache HIT for {cache_key} ({len(rows)} rows)")
+    else:
+        # --- Fetch from API ---
         try:
             creds = get_credentials()
-            cid = coerce_customer_id(customer_id, prefer_non_manager=True)
             headers = get_headers(creds, login_customer_id=login_customer_id)
-            
+            query = _build_search_terms_query(days, order_by, status_filter, min_impressions, min_cost)
+
+            logger.info(f"🔍 Fetching search terms for {cid} (days={days}, min_cost={min_cost})...")
             rows = _gaql_search_all(cid, query, headers)
             if not rows:
                 return "No search term data found."
-            
-            total_count = len(rows)
-            
-            # Aggregate by status
-            by_status = {"ADDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
-                        "EXCLUDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
-                        "NONE": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0}}
-            
-            total_clicks = 0
-            total_impressions = 0
-            total_cost = 0
-            total_conversions = 0
-            total_conv_value = 0
-            
-            for row in rows:
-                stv = row.get("searchTermView", {})
-                metrics = row.get("metrics", {})
-                
-                status = stv.get("status", "NONE")
-                clicks = int(metrics.get("clicks", 0))
-                impr = int(metrics.get("impressions", 0))
-                cost = int(metrics.get("costMicros", 0))
-                conv = float(metrics.get("conversions", 0))
-                conv_value = float(metrics.get("conversionsValue", 0))
-                
-                if status in by_status:
-                    by_status[status]["count"] += 1
-                    by_status[status]["clicks"] += clicks
-                    by_status[status]["impr"] += impr
-                    by_status[status]["cost"] += cost
-                    by_status[status]["conv"] += conv
-                    by_status[status]["conv_value"] += conv_value
-                
-                total_clicks += clicks
-                total_impressions += impr
-                total_cost += cost
-                total_conversions += conv
-                total_conv_value += conv_value
-            
-            avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
-            avg_cpc = (total_cost / total_clicks) if total_clicks > 0 else 0
-            roas = (total_conv_value / (total_cost / 1_000_000)) if total_cost > 0 else 0
-            cpa = ((total_cost / 1_000_000) / total_conversions) if total_conversions > 0 else 0
-            
-            lines = [
-                f"Search Terms Summary for {cid}",
-                "=" * 100,
-                f"Total search terms analyzed: {total_count}",
-                f"Showing detailed breakdown for top {min(max_results, total_count)} terms",
-                "",
-                "📊 AGGREGATE TOTALS (All Search Terms):",
-                f"   Total Impressions: {total_impressions:,}",
-                f"   Total Clicks: {total_clicks:,}",
-                f"   Total Cost: ${total_cost / 1_000_000:,.2f}",
-                f"   Total Conversions: {total_conversions:,.2f}",
-                f"   Total Conversion Value: ${total_conv_value:,.2f}",
-                f"   Average CTR: {avg_ctr:.2f}%",
-                f"   Average CPC: ${avg_cpc / 1_000_000:.2f}",
-                f"   ROAS: {roas:.2f}x",
-                f"   CPA: ${cpa:.2f}",
-                "",
-                "🏷️  BY STATUS:",
-                ""
-            ]
-            
-            for status, data in by_status.items():
-                if data["count"] > 0:
-                    status_ctr = (data["clicks"] / data["impr"] * 100) if data["impr"] > 0 else 0
-                    status_roas = (data["conv_value"] / (data["cost"] / 1_000_000)) if data["cost"] > 0 else 0
-                    status_cpa = ((data["cost"] / 1_000_000) / data["conv"]) if data["conv"] > 0 else 0
-                    lines.append(f"   {status} ({data['count']} terms):")
-                    lines.append(f"      Impressions: {data['impr']:,} | Clicks: {data['clicks']:,} | CTR: {status_ctr:.2f}%")
-                    lines.append(f"      Cost: ${data['cost'] / 1_000_000:,.2f} | Conversions: {data['conv']:,.2f} | Conv. Value: ${data['conv_value']:,.2f}")
-                    lines.append(f"      ROAS: {status_roas:.2f}x | CPA: ${status_cpa:.2f}")
-                    lines.append("")
-            
-            lines.extend([
-                "🎯 TOP SEARCH TERMS (Detailed):",
-                "=" * 100
-            ])
-            
-            # Show top results
-            for i, row in enumerate(rows[:max_results], 1):
-                stv = row.get("searchTermView", {})
-                campaign = row.get("campaign", {})
-                ad_group = row.get("adGroup", {})
-                metrics = row.get("metrics", {})
-                
-                term = stv.get("searchTerm", "(no term)")
-                status = stv.get("status", "NONE")
-                channel_type = campaign.get("advertisingChannelType", "UNKNOWN")
-                clicks = int(metrics.get("clicks", 0))
-                impr = int(metrics.get("impressions", 0))
-                cost = int(metrics.get("costMicros", 0))
-                conv = float(metrics.get("conversions", 0))
-                conv_value = float(metrics.get("conversionsValue", 0))
-                ctr = float(metrics.get("ctr", 0)) * 100
-                cpc = int(metrics.get("averageCpc", 0))
-                term_roas = (conv_value / (cost / 1_000_000)) if cost > 0 else 0
-                term_cpa = ((cost / 1_000_000) / conv) if conv > 0 else 0
-                
-                lines.append(f"\n{i}. \"{term}\" [{status}]")
-                lines.append(f"   Campaign: {campaign.get('name', 'Unknown')} ({channel_type})")
-                lines.append(f"   Impressions: {impr:,} | Clicks: {clicks:,} | CTR: {ctr:.2f}%")
-                lines.append(f"   Cost: ${cost / 1_000_000:,.2f} | CPC: ${cpc / 1_000_000:.2f} | Conversions: {conv:.2f} | Conv. Value: ${conv_value:.2f}")
-                lines.append(f"   ROAS: {term_roas:.2f}x | CPA: ${term_cpa:.2f}")
-            
-            if total_count > max_results:
-                lines.append(f"\n... and {total_count - max_results} more search terms (included in aggregate totals above)")
-            
-            return "\n".join(lines)
-            
+
+            summary = _compute_search_terms_summary(rows)
+
+            # Store in cache
+            _search_terms_cache[cache_key] = {"at": _now_s(), "rows": rows, "summary": summary}
+            logger.info(f"💾 Cached {len(rows)} search terms for {cache_key}")
         except Exception as e:
             return f"Error getting search terms: {str(e)}"
-    
-    # For other formats, limit results
-    return await run_gaql(
-        customer_id=customer_id,
-        query=query + f" LIMIT {max_results}",
-        format=format,
-        max_results=None,
-        fields=None,
-        login_customer_id=login_customer_id
+
+    # --- Pagination math ---
+    total_rows = len(rows)
+    total_pages = max(1, (total_rows + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    start_idx = (page - 1) * page_size
+    end_idx = min(start_idx + page_size, total_rows)
+    page_rows = rows[start_idx:end_idx]
+
+    pagination_info = (
+        f"Page {page}/{total_pages} | Rows {start_idx + 1}-{end_idx} of {total_rows} | "
+        f"Page size: {page_size}"
     )
+
+    # --- JSON format (for export / Sheets) ---
+    if format == "json":
+        result = {
+            "pagination": {
+                "current_page": page,
+                "total_pages": total_pages,
+                "page_size": page_size,
+                "total_rows": total_rows,
+                "start_row": start_idx + 1,
+                "end_row": end_idx,
+            },
+            "rows": [_format_search_term_json(r) for r in page_rows],
+        }
+        # Include summary only on page 1
+        if page == 1:
+            t = summary["totals"]
+            result["summary"] = {
+                "total_search_terms": total_rows,
+                "total_impressions": t["impr"],
+                "total_clicks": t["clicks"],
+                "total_cost": round(t["cost"] / 1_000_000, 2),
+                "total_conversions": t["conv"],
+                "total_conversions_value": round(t["conv_value"], 2),
+                "avg_ctr": round((t["clicks"] / t["impr"] * 100) if t["impr"] > 0 else 0, 2),
+                "avg_cpc": round((t["cost"] / t["clicks"] / 1_000_000) if t["clicks"] > 0 else 0, 2),
+                "roas": round((t["conv_value"] / (t["cost"] / 1_000_000)) if t["cost"] > 0 else 0, 2),
+                "cpa": round(((t["cost"] / 1_000_000) / t["conv"]) if t["conv"] > 0 else 0, 2),
+                "by_status": {
+                    s: {
+                        "count": int(d["count"]),
+                        "cost": round(d["cost"] / 1_000_000, 2),
+                        "conversions": d["conv"],
+                        "conversions_value": round(d["conv_value"], 2),
+                    }
+                    for s, d in summary["by_status"].items() if d["count"] > 0
+                },
+            }
+        return json.dumps(result, ensure_ascii=False)
+
+    # --- Summary format (human-readable) ---
+    lines: List[str] = []
+
+    # Include aggregate summary on page 1
+    if page == 1:
+        t = summary["totals"]
+        avg_ctr = (t["clicks"] / t["impr"] * 100) if t["impr"] > 0 else 0
+        avg_cpc = (t["cost"] / t["clicks"]) if t["clicks"] > 0 else 0
+        roas = (t["conv_value"] / (t["cost"] / 1_000_000)) if t["cost"] > 0 else 0
+        cpa = ((t["cost"] / 1_000_000) / t["conv"]) if t["conv"] > 0 else 0
+
+        lines.extend([
+            f"Search Terms Report for {cid}",
+            "=" * 100,
+            pagination_info,
+            "",
+            "📊 AGGREGATE TOTALS (All Search Terms):",
+            f"   Total Search Terms: {total_rows:,}",
+            f"   Total Impressions: {t['impr']:,}",
+            f"   Total Clicks: {t['clicks']:,}",
+            f"   Total Cost: ${t['cost'] / 1_000_000:,.2f}",
+            f"   Total Conversions: {t['conv']:,.2f}",
+            f"   Total Conversion Value: ${t['conv_value']:,.2f}",
+            f"   Average CTR: {avg_ctr:.2f}%",
+            f"   Average CPC: ${avg_cpc / 1_000_000:.2f}",
+            f"   ROAS: {roas:.2f}x",
+            f"   CPA: ${cpa:.2f}",
+            "",
+            "🏷️  BY STATUS:",
+            ""
+        ])
+
+        for status, data in summary["by_status"].items():
+            if data["count"] > 0:
+                status_ctr = (data["clicks"] / data["impr"] * 100) if data["impr"] > 0 else 0
+                status_roas = (data["conv_value"] / (data["cost"] / 1_000_000)) if data["cost"] > 0 else 0
+                status_cpa = ((data["cost"] / 1_000_000) / data["conv"]) if data["conv"] > 0 else 0
+                lines.append(f"   {status} ({int(data['count'])} terms):")
+                lines.append(f"      Impressions: {int(data['impr']):,} | Clicks: {int(data['clicks']):,} | CTR: {status_ctr:.2f}%")
+                lines.append(f"      Cost: ${data['cost'] / 1_000_000:,.2f} | Conversions: {data['conv']:,.2f} | Conv. Value: ${data['conv_value']:,.2f}")
+                lines.append(f"      ROAS: {status_roas:.2f}x | CPA: ${status_cpa:.2f}")
+                lines.append("")
+
+        lines.extend([
+            "🎯 SEARCH TERMS (Detailed):",
+            "=" * 100
+        ])
+    else:
+        lines.extend([
+            f"Search Terms Report for {cid} (continued)",
+            "=" * 100,
+            pagination_info,
+            "",
+        ])
+
+    # Render page rows
+    for i, row in enumerate(page_rows):
+        lines.append(_format_search_term_row(row, start_idx + i + 1))
+
+    # Pagination footer
+    lines.append("")
+    lines.append("-" * 100)
+    lines.append(pagination_info)
+    if page < total_pages:
+        lines.append(f"➡️  Call again with page={page + 1} to get the next {min(page_size, total_rows - end_idx)} search terms.")
+    else:
+        lines.append("✅ This is the last page.")
+
+    return "\n".join(lines)
 
 @mcp.tool()
 async def get_change_history(
