@@ -130,7 +130,7 @@ mcp = FastMCP(
 
 # ----------------------------- CONSTANTS -----------------------------
 SCOPES = ['https://www.googleapis.com/auth/adwords']
-API_VERSION = "v19"  # keep aligned with your Google Ads API
+API_VERSION = "v23"  # keep aligned with your Google Ads API (v23 released Jan 2026, sunset Feb 2027)
 
 # Load environment variables (optional)
 try:
@@ -390,7 +390,7 @@ def get_headers(creds, *, login_customer_id: Optional[str] = None):
 def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Fetch all rows for a GAQL query using googleAds:search pagination.
-    Note: For Google Ads API v19, page size is fixed by the API (10,000).
+    Note: For Google Ads API, page size is fixed by the API (10,000).
     Setting pageSize triggers PAGE_SIZE_NOT_SUPPORTED, so we do NOT send it.
     """
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
