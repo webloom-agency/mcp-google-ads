@@ -1575,9 +1575,11 @@ async def get_campaign_budgets(
     )
 
 def _search_terms_cache_key(cid: str, days: int, order_by: str, status_filter: Optional[str],
-                             min_impressions: int, min_cost: float) -> str:
+                             min_impressions: int, min_cost: float,
+                             include_dsa: bool = True, include_pmax: bool = True) -> str:
     """Build a deterministic cache key for search terms queries."""
-    return f"{cid}|{days}|{order_by}|{status_filter or 'ALL'}|mi{min_impressions}|mc{min_cost}"
+    return f"{cid}|{days}|{order_by}|{status_filter or 'ALL'}|mi{min_impressions}|mc{min_cost}|dsa{include_dsa}|pmax{include_pmax}"
+
 
 
 def _build_search_terms_query(days: int, order_by: str, status_filter: Optional[str],
@@ -1628,6 +1630,129 @@ def _build_search_terms_query(days: int, order_by: str, status_filter: Optional[
     """
 
 
+def _build_dsa_search_terms_query(days: int, order_by: str,
+                                   min_impressions: int, min_cost: float) -> str:
+    """Build the GAQL query for Dynamic Search Ads search terms."""
+    if days in (7, 14, 30, 60, 90, 180):
+        date_range = f"LAST_{days}_DAYS"
+    else:
+        date_range = "LAST_30_DAYS"
+
+    where_clauses = [
+        f"segments.date DURING {date_range}",
+        "campaign.status = 'ENABLED'"
+    ]
+    if min_impressions > 0:
+        where_clauses.append(f"metrics.impressions >= {min_impressions}")
+    if min_cost > 0:
+        min_cost_micros = int(min_cost * 1_000_000)
+        where_clauses.append(f"metrics.cost_micros >= {min_cost_micros}")
+
+    order_map = {
+        "cost": "metrics.cost_micros DESC",
+        "clicks": "metrics.clicks DESC",
+        "conversions": "metrics.conversions DESC",
+        "impressions": "metrics.impressions DESC"
+    }
+    order_clause = order_map.get(order_by.lower(), "metrics.cost_micros DESC")
+
+    return f"""
+        SELECT
+            campaign.name,
+            campaign.advertising_channel_type,
+            ad_group.name,
+            dynamic_search_ads_search_term_view.search_term,
+            dynamic_search_ads_search_term_view.headline,
+            dynamic_search_ads_search_term_view.landing_page,
+            metrics.clicks,
+            metrics.impressions,
+            metrics.ctr,
+            metrics.average_cpc,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.conversions_value
+        FROM dynamic_search_ads_search_term_view
+        WHERE {" AND ".join(where_clauses)}
+        ORDER BY {order_clause}
+    """
+
+
+def _build_pmax_search_terms_query(days: int, order_by: str,
+                                    min_impressions: int, min_cost: float) -> str:
+    """Build the GAQL query for Performance Max search terms (individual terms via campaign_search_term_view)."""
+    if days in (7, 14, 30, 60, 90, 180):
+        date_range = f"LAST_{days}_DAYS"
+    else:
+        date_range = "LAST_30_DAYS"
+
+    where_clauses = [
+        f"segments.date DURING {date_range}",
+        "campaign.status = 'ENABLED'"
+    ]
+    if min_impressions > 0:
+        where_clauses.append(f"metrics.impressions >= {min_impressions}")
+    if min_cost > 0:
+        min_cost_micros = int(min_cost * 1_000_000)
+        where_clauses.append(f"metrics.cost_micros >= {min_cost_micros}")
+
+    order_map = {
+        "cost": "metrics.cost_micros DESC",
+        "clicks": "metrics.clicks DESC",
+        "conversions": "metrics.conversions DESC",
+        "impressions": "metrics.impressions DESC"
+    }
+    order_clause = order_map.get(order_by.lower(), "metrics.cost_micros DESC")
+
+    return f"""
+        SELECT
+            campaign.name,
+            campaign.advertising_channel_type,
+            campaign_search_term_view.search_term,
+            metrics.clicks,
+            metrics.impressions,
+            metrics.ctr,
+            metrics.average_cpc,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.conversions_value
+        FROM campaign_search_term_view
+        WHERE {" AND ".join(where_clauses)}
+        ORDER BY {order_clause}
+    """
+
+
+def _normalize_dsa_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a DSA search term row to match search_term_view format."""
+    dsa = row.get("dynamicSearchAdsSearchTermView", {})
+    return {
+        "campaign": row.get("campaign", {}),
+        "adGroup": row.get("adGroup", {}),
+        "searchTermView": {
+            "searchTerm": dsa.get("searchTerm", ""),
+            "status": "NONE",
+        },
+        "metrics": row.get("metrics", {}),
+        "_source": "DSA",
+        "_dsaHeadline": dsa.get("headline", ""),
+        "_dsaLandingPage": dsa.get("landingPage", ""),
+    }
+
+
+def _normalize_pmax_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a PMAX campaign_search_term_view row to match search_term_view format."""
+    cstv = row.get("campaignSearchTermView", {})
+    return {
+        "campaign": row.get("campaign", {}),
+        "adGroup": {"name": ""},  # PMAX has no traditional ad groups
+        "searchTermView": {
+            "searchTerm": cstv.get("searchTerm", ""),
+            "status": "NONE",
+        },
+        "metrics": row.get("metrics", {}),
+        "_source": "PMAX",
+    }
+
+
 def _compute_search_terms_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Compute aggregate summary over all search term rows. Computed once, cached."""
     by_status: Dict[str, Dict[str, float]] = {
@@ -1635,11 +1760,13 @@ def _compute_search_terms_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "EXCLUDED": {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
         "NONE":     {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0},
     }
+    by_source: Dict[str, Dict[str, float]] = {}
     totals = {"clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0}
 
     for row in rows:
         stv = row.get("searchTermView", {})
         m = row.get("metrics", {})
+        source = row.get("_source", "SEARCH")
         status = stv.get("status", "NONE")
         clicks = int(m.get("clicks", 0))
         impr = int(m.get("impressions", 0))
@@ -1661,7 +1788,29 @@ def _compute_search_terms_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         totals["conv"] += conv
         totals["conv_value"] += conv_value
 
-    return {"total_count": len(rows), "totals": totals, "by_status": by_status}
+        # Track by source
+        if source not in by_source:
+            by_source[source] = {"count": 0, "clicks": 0, "impr": 0, "cost": 0, "conv": 0, "conv_value": 0}
+        src = by_source[source]
+        src["count"] += 1
+        src["clicks"] += clicks
+        src["impr"] += impr
+        src["cost"] += cost
+        src["conv"] += conv
+        src["conv_value"] += conv_value
+
+    # Format by_source for output
+    by_source_out = {}
+    for s, d in by_source.items():
+        by_source_out[s] = {
+            "count": int(d["count"]),
+            "clicks": int(d["clicks"]),
+            "impressions": int(d["impr"]),
+            "cost": round(d["cost"] / 1_000_000, 2),
+            "conversions": d["conv"],
+        }
+
+    return {"total_count": len(rows), "totals": totals, "by_status": by_status, "by_source": by_source_out}
 
 
 def _format_search_term_row(row: Dict[str, Any], index: int) -> str:
@@ -1670,6 +1819,7 @@ def _format_search_term_row(row: Dict[str, Any], index: int) -> str:
     campaign = row.get("campaign", {})
     ad_group = row.get("adGroup", {})
     m = row.get("metrics", {})
+    source = row.get("_source", "SEARCH")
 
     term = stv.get("searchTerm", "(no term)")
     status = stv.get("status", "NONE")
@@ -1685,13 +1835,19 @@ def _format_search_term_row(row: Dict[str, Any], index: int) -> str:
     term_cpa = ((cost / 1_000_000) / conv) if conv > 0 else 0
     conv_rate = (conv / clicks * 100) if clicks > 0 else 0
 
+    source_tag = f" [{source}]" if source != "SEARCH" else ""
     lines = [
-        f"\n{index}. \"{term}\" [{status}]",
+        f"\n{index}. \"{term}\" [{status}]{source_tag}",
         f"   Campaign: {campaign.get('name', 'Unknown')} ({channel_type}) | Ad Group: {ad_group.get('name', 'Unknown')}",
         f"   Impressions: {impr:,} | Clicks: {clicks:,} | CTR: {ctr:.2f}%",
         f"   Cost: ${cost / 1_000_000:,.2f} | CPC: ${cpc / 1_000_000:.2f} | Conversions: {conv:.2f} | Conv. Value: ${conv_value:.2f}",
         f"   Conv. Rate: {conv_rate:.2f}% | ROAS: {term_roas:.2f}x | CPA: ${term_cpa:.2f}",
     ]
+    if source == "DSA":
+        headline = row.get("_dsaHeadline", "")
+        landing = row.get("_dsaLandingPage", "")
+        if headline or landing:
+            lines.append(f"   DSA Headline: {headline} | Landing: {landing}")
     return "\n".join(lines)
 
 
@@ -1701,14 +1857,16 @@ def _format_search_term_json(row: Dict[str, Any]) -> Dict[str, Any]:
     campaign = row.get("campaign", {})
     ad_group = row.get("adGroup", {})
     m = row.get("metrics", {})
+    source = row.get("_source", "SEARCH")
 
     cost = int(m.get("costMicros", 0))
     conv = float(m.get("conversions", 0))
     conv_value = float(m.get("conversionsValue", 0))
     clicks = int(m.get("clicks", 0))
 
-    return {
+    result = {
         "search_term": stv.get("searchTerm", ""),
+        "source": source,
         "status": stv.get("status", "NONE"),
         "campaign": campaign.get("name", ""),
         "channel_type": campaign.get("advertisingChannelType", "UNKNOWN"),
@@ -1724,6 +1882,11 @@ def _format_search_term_json(row: Dict[str, Any]) -> Dict[str, Any]:
         "cpa": round(((cost / 1_000_000) / conv) if conv > 0 else 0, 2),
         "roas": round((conv_value / (cost / 1_000_000)) if cost > 0 else 0, 2),
     }
+    # Add DSA-specific fields
+    if source == "DSA":
+        result["dsa_headline"] = row.get("_dsaHeadline", "")
+        result["dsa_landing_page"] = row.get("_dsaLandingPage", "")
+    return result
 
 
 SEARCH_TERMS_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_TERMS_CACHE_TTL_SECONDS", "600"))  # 10 min default
@@ -1739,23 +1902,25 @@ async def get_search_terms(
     format: str = Field(default="json", description="'json' (default - all rows as flat JSON for export), 'summary' (aggregates + top N detailed rows)"),
     min_impressions: int = Field(default=0, description="Minimum impressions filter (default 0)"),
     min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
+    include_dsa: bool = Field(default=True, description="Include Dynamic Search Ads search terms (from dynamic_search_ads_search_term_view)"),
+    include_pmax: bool = Field(default=True, description="Include Performance Max search terms (individual terms from campaign_search_term_view, with full metrics including cost)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
     Get search terms report — returns ALL matching rows in a single response.
     
-    Fetches all search terms from Google Ads API (handles API pagination internally),
-    then returns everything at once. Results are cached for 10 minutes so repeated
-    calls with the same parameters are instant.
+    Fetches search terms from up to 3 sources:
+      1. search_term_view — Standard Search & Shopping campaigns (always included)
+      2. dynamic_search_ads_search_term_view — DSA campaigns (include_dsa=True)
+      3. campaign_search_term_view — Performance Max campaigns (include_pmax=True)
     
-    format='json' (default): Returns ALL rows as flat JSON with pre-computed metrics
-    (cost, CPA, ROAS, conv_rate). Ideal for bulk export to Google Sheets.
-    Each row includes: search_term, status, campaign, channel_type, ad_group,
-    impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value,
-    conv_rate, cpa, roas.
+    Each row includes a 'source' field: 'SEARCH', 'DSA', or 'PMAX'.
+    All sources return individual search terms with full metrics (including cost).
     
+    Results are cached for 10 minutes so repeated calls are instant.
+    
+    format='json' (default): Returns ALL rows as flat JSON with pre-computed metrics.
     format='summary': Human-readable report with aggregate totals + top N rows.
-    Use max_results to control how many detailed rows appear (0 = show all).
     
     Typical usage for large accounts:
       get_search_terms(customer_id="...", days=14, min_cost=1.0, format="json")
@@ -1766,7 +1931,8 @@ async def get_search_terms(
     except Exception as e:
         return f"Error resolving customer ID: {str(e)}"
 
-    cache_key = _search_terms_cache_key(cid, days, order_by, status_filter, min_impressions, min_cost)
+    cache_key = _search_terms_cache_key(cid, days, order_by, status_filter, min_impressions, min_cost,
+                                         include_dsa=include_dsa, include_pmax=include_pmax)
 
     # --- Check cache ---
     cached = _search_terms_cache.get(cache_key)
@@ -1779,12 +1945,51 @@ async def get_search_terms(
         try:
             creds = get_credentials()
             headers = get_headers(creds, login_customer_id=login_customer_id)
-            query = _build_search_terms_query(days, order_by, status_filter, min_impressions, min_cost)
 
+            # 1) Standard search_term_view (Search + Shopping)
+            query = _build_search_terms_query(days, order_by, status_filter, min_impressions, min_cost)
             logger.info(f"🔍 Fetching search terms for {cid} (days={days}, min_cost={min_cost})...")
             rows = _gaql_search_all(cid, query, headers)
+            # Tag standard rows with source
+            for r in rows:
+                r["_source"] = "SEARCH"
+
+            # 2) DSA search terms
+            if include_dsa:
+                try:
+                    dsa_query = _build_dsa_search_terms_query(days, order_by, min_impressions, min_cost)
+                    logger.info(f"🔍 Fetching DSA search terms for {cid}...")
+                    dsa_rows = _gaql_search_all(cid, dsa_query, headers)
+                    normalized_dsa = [_normalize_dsa_row(r) for r in dsa_rows]
+                    rows.extend(normalized_dsa)
+                    logger.info(f"   ✓ {len(dsa_rows)} DSA search terms found")
+                except Exception as e:
+                    logger.warning(f"⚠ DSA search terms query failed (skipping): {e}")
+
+            # 3) PMAX search terms (individual terms via campaign_search_term_view)
+            if include_pmax:
+                try:
+                    pmax_query = _build_pmax_search_terms_query(days, order_by, min_impressions, min_cost)
+                    logger.info(f"🔍 Fetching PMAX search terms for {cid}...")
+                    pmax_rows = _gaql_search_all(cid, pmax_query, headers)
+                    normalized_pmax = [_normalize_pmax_row(r) for r in pmax_rows]
+                    rows.extend(normalized_pmax)
+                    logger.info(f"   ✓ {len(pmax_rows)} PMAX search terms found")
+                except Exception as e:
+                    logger.warning(f"⚠ PMAX search terms query failed (skipping): {e}")
+
             if not rows:
                 return "No search term data found."
+
+            # Re-sort merged rows by the chosen order metric
+            order_key_map = {
+                "cost": lambda r: int(r.get("metrics", {}).get("costMicros", 0)),
+                "clicks": lambda r: int(r.get("metrics", {}).get("clicks", 0)),
+                "conversions": lambda r: float(r.get("metrics", {}).get("conversions", 0)),
+                "impressions": lambda r: int(r.get("metrics", {}).get("impressions", 0)),
+            }
+            sort_fn = order_key_map.get(order_by.lower(), order_key_map["cost"])
+            rows.sort(key=sort_fn, reverse=True)
 
             summary = _compute_search_terms_summary(rows)
 
@@ -1824,6 +2029,7 @@ async def get_search_terms(
                     }
                     for s, d in summary["by_status"].items() if d["count"] > 0
                 },
+                "by_source": summary.get("by_source", {}),
             },
             "rows": [_format_search_term_json(r) for r in output_rows],
         }
@@ -1867,6 +2073,17 @@ async def get_search_terms(
             lines.append(f"      Cost: ${data['cost'] / 1_000_000:,.2f} | Conversions: {data['conv']:,.2f} | Conv. Value: ${data['conv_value']:,.2f}")
             lines.append(f"      ROAS: {status_roas:.2f}x | CPA: ${status_cpa:.2f}")
             lines.append("")
+
+    # Source breakdown
+    by_source = summary.get("by_source", {})
+    if len(by_source) > 1:  # Only show if there are multiple sources
+        lines.append("📡 BY SOURCE:")
+        lines.append("")
+        source_labels = {"SEARCH": "Search/Shopping", "DSA": "Dynamic Search Ads", "PMAX": "Performance Max"}
+        for src, data in by_source.items():
+            label = source_labels.get(src, src)
+            lines.append(f"   {label}: {data['count']} rows | {data['clicks']} clicks | {data['impressions']:,} impressions | ${data['cost']:,.2f} cost")
+        lines.append("")
 
     lines.extend([
         "🎯 SEARCH TERMS (Detailed):",
