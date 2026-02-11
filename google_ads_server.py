@@ -1687,7 +1687,8 @@ def _build_pmax_search_terms_query(days: int, order_by: str,
 
     where_clauses = [
         f"segments.date DURING {date_range}",
-        "campaign.status = 'ENABLED'"
+        "campaign.status = 'ENABLED'",
+        "campaign.advertising_channel_type = 'PERFORMANCE_MAX'"
     ]
     if min_impressions > 0:
         where_clauses.append(f"metrics.impressions >= {min_impressions}")
@@ -1904,6 +1905,8 @@ async def get_search_terms(
     min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
     include_dsa: bool = Field(default=True, description="Include Dynamic Search Ads search terms (from dynamic_search_ads_search_term_view)"),
     include_pmax: bool = Field(default=True, description="Include Performance Max search terms (individual terms from campaign_search_term_view, with full metrics including cost)"),
+    fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include per row (e.g. 'search_term,source,campaign,impressions,clicks,conversions,cpa,cost'). None = all fields. Available: search_term, source, status, campaign, channel_type, ad_group, impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value, conv_rate, cpa, roas"),
+    include_summary: bool = Field(default=True, description="Include summary/aggregates in JSON output. Set false for minimal output."),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
@@ -2005,11 +2008,27 @@ async def get_search_terms(
     if format == "json":
         output_rows = rows if (max_results <= 0) else rows[:max_results]
 
-        t = summary["totals"]
-        result = {
+        # Parse fields filter
+        fields_set = None
+        if fields:
+            fields_set = set(f.strip().lower() for f in fields.split(",") if f.strip())
+
+        # Format rows, optionally filtering fields
+        formatted_rows = []
+        for r in output_rows:
+            row_json = _format_search_term_json(r)
+            if fields_set:
+                row_json = {k: v for k, v in row_json.items() if k in fields_set}
+            formatted_rows.append(row_json)
+
+        result: Dict[str, Any] = {
             "total_rows": total_rows,
             "returned_rows": len(output_rows),
-            "summary": {
+        }
+
+        if include_summary:
+            t = summary["totals"]
+            result["summary"] = {
                 "total_search_terms": total_rows,
                 "total_impressions": t["impr"],
                 "total_clicks": t["clicks"],
@@ -2030,9 +2049,9 @@ async def get_search_terms(
                     for s, d in summary["by_status"].items() if d["count"] > 0
                 },
                 "by_source": summary.get("by_source", {}),
-            },
-            "rows": [_format_search_term_json(r) for r in output_rows],
-        }
+            }
+
+        result["rows"] = formatted_rows
         return json.dumps(result, ensure_ascii=False)
 
     # --- Summary format (human-readable) ---
