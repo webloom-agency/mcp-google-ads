@@ -1617,6 +1617,7 @@ def _build_search_terms_query(days: int, order_by: str, status_filter: Optional[
             ad_group.name,
             search_term_view.search_term,
             search_term_view.status,
+            segments.keyword.info.match_type,
             metrics.clicks,
             metrics.impressions,
             metrics.ctr,
@@ -1822,9 +1823,12 @@ def _format_search_term_row(row: Dict[str, Any], index: int) -> str:
     m = row.get("metrics", {})
     source = row.get("_source", "SEARCH")
 
+    segments = row.get("segments", {})
     term = stv.get("searchTerm", "(no term)")
     status = stv.get("status", "NONE")
     channel_type = campaign.get("advertisingChannelType", "UNKNOWN")
+    keyword_info = segments.get("keyword", {}).get("info", {})
+    match_type = keyword_info.get("matchType", "UNSPECIFIED")
     clicks = int(m.get("clicks", 0))
     impr = int(m.get("impressions", 0))
     cost = int(m.get("costMicros", 0))
@@ -1838,7 +1842,7 @@ def _format_search_term_row(row: Dict[str, Any], index: int) -> str:
 
     source_tag = f" [{source}]" if source != "SEARCH" else ""
     lines = [
-        f"\n{index}. \"{term}\" [{status}]{source_tag}",
+        f"\n{index}. \"{term}\" [{status}] Match: {match_type}{source_tag}",
         f"   Campaign: {campaign.get('name', 'Unknown')} ({channel_type}) | Ad Group: {ad_group.get('name', 'Unknown')}",
         f"   Impressions: {impr:,} | Clicks: {clicks:,} | CTR: {ctr:.2f}%",
         f"   Cost: ${cost / 1_000_000:,.2f} | CPC: ${cpc / 1_000_000:.2f} | Conversions: {conv:.2f} | Conv. Value: ${conv_value:.2f}",
@@ -1859,16 +1863,21 @@ def _format_search_term_json(row: Dict[str, Any]) -> Dict[str, Any]:
     ad_group = row.get("adGroup", {})
     m = row.get("metrics", {})
     source = row.get("_source", "SEARCH")
+    segments = row.get("segments", {})
 
     cost = int(m.get("costMicros", 0))
     conv = float(m.get("conversions", 0))
     conv_value = float(m.get("conversionsValue", 0))
     clicks = int(m.get("clicks", 0))
 
+    keyword_info = segments.get("keyword", {}).get("info", {})
+    match_type = keyword_info.get("matchType", "UNSPECIFIED")
+
     result = {
         "search_term": stv.get("searchTerm", ""),
         "source": source,
         "status": stv.get("status", "NONE"),
+        "match_type": match_type,
         "campaign": campaign.get("name", ""),
         "channel_type": campaign.get("advertisingChannelType", "UNKNOWN"),
         "ad_group": ad_group.get("name", ""),
@@ -1913,7 +1922,7 @@ async def get_search_terms(
     min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
     include_dsa: bool = Field(default=True, description="Include Dynamic Search Ads search terms (from dynamic_search_ads_search_term_view)"),
     include_pmax: bool = Field(default=True, description="Include Performance Max search terms (individual terms from campaign_search_term_view, with full metrics including cost)"),
-    fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include per row (e.g. 'search_term,source,campaign,impressions,clicks,conversions,cpa,cost'). None = all fields. Available: search_term, source, status, campaign, channel_type, ad_group, impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value, conv_rate, cpa, roas"),
+    fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include per row (e.g. 'search_term,source,campaign,impressions,clicks,conversions,cpa,cost'). None = all fields. Available: search_term, source, status, match_type, campaign, channel_type, ad_group, impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value, conv_rate, cpa, roas"),
     include_summary: bool = Field(default=True, description="Include summary/aggregates in JSON output. Set false for minimal output."),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
