@@ -1893,6 +1893,14 @@ def _format_search_term_json(row: Dict[str, Any]) -> Dict[str, Any]:
 SEARCH_TERMS_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_TERMS_CACHE_TTL_SECONDS", "600"))  # 10 min default
 
 
+def _get_account_name(cid: str) -> str:
+    """Look up the descriptive account name for a customer ID from the index."""
+    for item in _active_index():
+        if normalize_customer_id(item.get("id", "")) == cid:
+            return item.get("name", "") or ""
+    return ""
+
+
 @mcp.tool()
 async def get_search_terms(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
@@ -2021,7 +2029,10 @@ async def get_search_terms(
                 row_json = {k: v for k, v in row_json.items() if k in fields_set}
             formatted_rows.append(row_json)
 
+        account_name = _get_account_name(cid)
         result: Dict[str, Any] = {
+            "customer_id": cid,
+            "account_name": account_name,
             "total_rows": total_rows,
             "returned_rows": len(output_rows),
         }
@@ -2061,8 +2072,10 @@ async def get_search_terms(
     roas = (t["conv_value"] / (t["cost"] / 1_000_000)) if t["cost"] > 0 else 0
     cpa = ((t["cost"] / 1_000_000) / t["conv"]) if t["conv"] > 0 else 0
 
+    account_name = _get_account_name(cid)
+    account_label = f"{account_name} ({cid})" if account_name else cid
     lines: List[str] = [
-        f"Search Terms Report for {cid}",
+        f"Search Terms Report for {account_label}",
         "=" * 100,
         f"Total search terms: {total_rows:,}",
         "",
