@@ -575,13 +575,27 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
 
 def _active_index(force: bool = False) -> List[Dict[str, Any]]:
     """
-    Choose which index to use (hierarchy preferred).
+    Merge hierarchy index with listAccessibleCustomers so that accounts
+    under OTHER MCCs (not just GOOGLE_ADS_LOGIN_CUSTOMER_ID) are visible.
     """
     if USE_HIERARCHY_LOOKUP:
-        items = get_full_hierarchy_index(force=force, include_managers=True, include_hidden=False, max_level=10)
-        if items:
-            return items
-    return get_accounts_index(force=force)
+        hier = get_full_hierarchy_index(force=force, include_managers=True, include_hidden=False, max_level=10)
+    else:
+        hier = []
+
+    accessible = get_accounts_index(force=force)
+
+    if not hier:
+        return accessible
+    if not accessible:
+        return hier
+
+    known_ids = {a["id"] for a in hier}
+    merged = list(hier)
+    for a in accessible:
+        if a["id"] not in known_ids:
+            merged.append(a)
+    return merged
 
 # ----------------------------- NAME/ID RESOLUTION -----------------------------
 def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
