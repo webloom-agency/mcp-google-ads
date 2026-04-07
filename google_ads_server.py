@@ -157,6 +157,8 @@ USE_HIERARCHY_LOOKUP = os.getenv("USE_HIERARCHY_LOOKUP", "1") not in ("0", "fals
 
 _accounts_cache: Dict[str, Any] = {"at": 0, "items": []}     # listAccessibleCustomers-based (fallback)
 _hierarchy_cache: Dict[str, Any] = {"at": 0, "items": []}    # customer_client-based (full subtree)
+_merged_index_cache: Dict[str, Any] = {"at": 0, "items": []} # merged index (hierarchy + all accessible MCCs)
+_building_active_index: bool = False                          # recursion guard for _active_index
 _search_terms_cache: Dict[str, Any] = {}                     # search terms paginated cache: {cache_key: {"at": int, "rows": [...], "summary": {...}}}
 
 # ----------------------------- HELPERS -----------------------------
@@ -485,7 +487,8 @@ def get_full_hierarchy_index(
             "manager": manager,
             "status": status,
             "currency": currency,
-            "level": level
+            "level": level,
+            "login_cid": root_id,
         })
 
     _hierarchy_cache["items"] = items
@@ -587,36 +590,104 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     _accounts_cache["at"] = _now_s()
     return items
 
+def _walk_mcc_hierarchy(mcc_id: str) -> List[Dict[str, Any]]:
+    """Walk the customer_client hierarchy under a single MCC and return account list."""
+    query = """
+        SELECT
+          customer_client.id,
+          customer_client.descriptive_name,
+          customer_client.manager,
+          customer_client.level,
+          customer_client.status,
+          customer_client.currency_code
+        FROM customer_client
+        WHERE customer_client.level <= 10
+          AND customer_client.status = 'ENABLED'
+        ORDER BY customer_client.level, customer_client.descriptive_name
+    """.strip()
+    try:
+        creds = get_credentials()
+        headers = get_headers(creds, login_customer_id=mcc_id)
+        rows = _gaql_search_all(mcc_id, query, headers)
+    except Exception as e:
+        logger.warning(f"Could not walk hierarchy for MCC {mcc_id}: {e}")
+        return []
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        cc = row.get("customerClient", {})
+        cid = normalize_customer_id(cc.get("id", ""))
+        items.append({
+            "id": cid,
+            "name": cc.get("descriptiveName", "") or "",
+            "manager": bool(cc.get("manager", False)),
+            "status": cc.get("status", ""),
+            "currency": cc.get("currencyCode", ""),
+            "level": cc.get("level", 0),
+            "login_cid": mcc_id,
+        })
+    return items
+
 def _active_index(force: bool = False) -> List[Dict[str, Any]]:
     """
     Merge hierarchy index with listAccessibleCustomers so that accounts
     under OTHER MCCs (not just GOOGLE_ADS_LOGIN_CUSTOMER_ID) are visible.
+    Also walks the hierarchy of other accessible MCCs to discover their sub-accounts.
     """
-    if USE_HIERARCHY_LOOKUP:
-        hier = get_full_hierarchy_index(force=force, include_managers=True, include_hidden=False, max_level=10)
-    else:
-        hier = []
+    global _building_active_index
 
-    accessible = get_accounts_index(force=force)
+    if (
+        not force
+        and _merged_index_cache["items"]
+        and _now_s() - _merged_index_cache["at"] < HIER_CACHE_TTL_SECONDS
+    ):
+        return _merged_index_cache["items"]
 
-    if not hier:
-        return accessible
-    if not accessible:
-        return hier
+    # Recursion guard: if we're already building, return the best partial data
+    if _building_active_index:
+        if _hierarchy_cache.get("items"):
+            return _hierarchy_cache["items"]
+        if _accounts_cache.get("items"):
+            return _accounts_cache["items"]
+        return []
 
-    known_ids = {a["id"] for a in hier}
-    merged = list(hier)
-    for a in accessible:
-        if a["id"] not in known_ids:
-            merged.append(a)
-    return merged
+    _building_active_index = True
+    try:
+        if USE_HIERARCHY_LOOKUP:
+            hier = get_full_hierarchy_index(force=force, include_managers=True, include_hidden=False, max_level=10)
+        else:
+            hier = []
+
+        accessible = get_accounts_index(force=force)
+
+        known_ids = {a["id"] for a in hier}
+        merged = list(hier)
+
+        root_mcc = normalize_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID) if GOOGLE_ADS_LOGIN_CUSTOMER_ID else ""
+
+        for a in accessible:
+            if a["id"] not in known_ids:
+                merged.append(a)
+                known_ids.add(a["id"])
+
+            if a.get("manager") and a["id"] != root_mcc and USE_HIERARCHY_LOOKUP:
+                sub_accounts = _walk_mcc_hierarchy(a["id"])
+                for sa in sub_accounts:
+                    if sa["id"] not in known_ids:
+                        merged.append(sa)
+                        known_ids.add(sa["id"])
+
+        _merged_index_cache["items"] = merged
+        _merged_index_cache["at"] = _now_s()
+        return merged
+    finally:
+        _building_active_index = False
 
 def _resolve_login_customer_id(customer_id: str, explicit: Optional[str] = None) -> Optional[str]:
     """
     Determine the correct login-customer-id for a target customer.
     If *explicit* is provided (user override), use it.
-    Otherwise check: hierarchy cache → root MCC, accounts cache → stored login_cid.
-    Populates caches on first call if needed.
+    Otherwise search the full merged index (hierarchy + all accessible MCCs).
     Returns None when the default env MCC should be used.
     """
     if explicit:
@@ -624,19 +695,12 @@ def _resolve_login_customer_id(customer_id: str, explicit: Optional[str] = None)
 
     cid = normalize_customer_id(customer_id)
 
-    # Ensure caches are populated (lazy init via _active_index)
-    if not _hierarchy_cache.get("items") and not _accounts_cache.get("items"):
-        _active_index()
-
-    for a in _hierarchy_cache.get("items", []):
-        if a["id"] == cid:
-            return normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
-
-    for a in _accounts_cache.get("items", []):
+    for a in _active_index():
         if a["id"] == cid:
             stored = a.get("login_cid")
             if stored:
                 return stored
+            return normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
 
     return None
 
