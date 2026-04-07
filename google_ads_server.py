@@ -390,20 +390,27 @@ def get_headers(creds, *, login_customer_id: Optional[str] = None):
 
 # ----------------------------- GAQL SEARCH (pagination helper) -----------------------------
 def _get_known_mcc_ids() -> List[str]:
-    """Return all known MCC IDs from all caches (for login-customer-id fallback)."""
+    """Return all known/possible MCC IDs from all caches (for login-customer-id fallback).
+    Includes accounts with unknown manager status (manager=None) since they
+    might be MCCs whose details we couldn't fetch during discovery."""
     mccs: List[str] = []
+    unknown: List[str] = []
     root = normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
     if root:
         mccs.append(root)
     for cache in (_accounts_cache, _hierarchy_cache, _merged_index_cache):
         for a in cache.get("items", []):
             aid = a.get("id", "")
-            if a.get("manager") and aid and aid not in mccs:
+            mgr = a.get("manager")
+            if mgr is True and aid and aid not in mccs:
                 mccs.append(aid)
+            elif mgr is None and aid and aid not in mccs and aid not in unknown:
+                unknown.append(aid)
             login = a.get("login_cid", "")
             if login and login not in mccs:
                 mccs.append(login)
-    return mccs
+    # Known MCCs first, then unknown-status accounts as last resort
+    return mccs + unknown
 
 def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """
@@ -442,7 +449,14 @@ def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict
                 headers["login-customer-id"] = cid
                 r = _google_ads_request("POST", url, headers, json=payload)
 
-            # 3) Brute-force: try each known MCC
+            # 3) Try WITHOUT login-customer-id (standalone accounts)
+            if r.status_code == 403:
+                logger.info(f"Retry 3: no login-customer-id header for customer {cid}")
+                headers = dict(headers)
+                headers.pop("login-customer-id", None)
+                r = _google_ads_request("POST", url, headers, json=payload)
+
+            # 4) Scan known MCCs
             if r.status_code == 403:
                 tried = {original_login, resolved, cid}
                 for mcc_id in _get_known_mcc_ids():
