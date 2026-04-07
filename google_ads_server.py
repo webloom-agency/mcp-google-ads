@@ -389,12 +389,28 @@ def get_headers(creds, *, login_customer_id: Optional[str] = None):
     return headers
 
 # ----------------------------- GAQL SEARCH (pagination helper) -----------------------------
+def _get_known_mcc_ids() -> List[str]:
+    """Return all known MCC IDs from all caches (for login-customer-id fallback)."""
+    mccs: List[str] = []
+    root = normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
+    if root:
+        mccs.append(root)
+    for cache in (_accounts_cache, _hierarchy_cache, _merged_index_cache):
+        for a in cache.get("items", []):
+            aid = a.get("id", "")
+            if a.get("manager") and aid and aid not in mccs:
+                mccs.append(aid)
+            login = a.get("login_cid", "")
+            if login and login not in mccs:
+                mccs.append(login)
+    return mccs
+
 def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Fetch all rows for a GAQL query using googleAds:search pagination.
     Note: For Google Ads API, page size is fixed by the API (10,000).
     Setting pageSize triggers PAGE_SIZE_NOT_SUPPORTED, so we do NOT send it.
-    On 403 USER_PERMISSION_DENIED, auto-retries with a resolved login-customer-id.
+    On 403 USER_PERMISSION_DENIED, auto-retries with resolved / known MCCs.
     """
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
     results: List[Dict[str, Any]] = []
@@ -408,12 +424,38 @@ def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict
         r = _google_ads_request("POST", url, headers, json=payload)
 
         if r.status_code == 403 and "USER_PERMISSION_DENIED" in r.text and not page_token:
+            original_login = headers.get("login-customer-id")
+            logger.warning(f"403 for customer {cid} with login-customer-id={original_login}")
+
+            # 1) Try the resolved login_customer_id from the index
             resolved = _resolve_login_customer_id(cid)
-            if resolved and resolved != headers.get("login-customer-id"):
-                logger.info(f"Retrying with login-customer-id={resolved} for customer {cid}")
+            if resolved and resolved != original_login:
+                logger.info(f"Retry 1: login-customer-id={resolved} for customer {cid}")
                 headers = dict(headers)
                 headers["login-customer-id"] = resolved
                 r = _google_ads_request("POST", url, headers, json=payload)
+
+            # 2) Try the customer itself as login-customer-id
+            if r.status_code == 403 and cid != original_login and cid != resolved:
+                logger.info(f"Retry 2: login-customer-id={cid} (self) for customer {cid}")
+                headers = dict(headers)
+                headers["login-customer-id"] = cid
+                r = _google_ads_request("POST", url, headers, json=payload)
+
+            # 3) Brute-force: try each known MCC
+            if r.status_code == 403:
+                tried = {original_login, resolved, cid}
+                for mcc_id in _get_known_mcc_ids():
+                    if mcc_id in tried:
+                        continue
+                    logger.info(f"Retry MCC scan: login-customer-id={mcc_id} for customer {cid}")
+                    headers = dict(headers)
+                    headers["login-customer-id"] = mcc_id
+                    r = _google_ads_request("POST", url, headers, json=payload)
+                    if r.status_code == 200:
+                        logger.info(f"✅ Found working MCC {mcc_id} for customer {cid}")
+                        break
+                    tried.add(mcc_id)
 
         if r.status_code != 200:
             raise RuntimeError(f"GAQL search error [{r.status_code}]: {r.text}")
@@ -657,8 +699,12 @@ def _active_index(force: bool = False) -> List[Dict[str, Any]]:
             hier = get_full_hierarchy_index(force=force, include_managers=True, include_hidden=False, max_level=10)
         else:
             hier = []
+        logger.info(f"📋 Hierarchy index: {len(hier)} accounts under root MCC")
 
         accessible = get_accounts_index(force=force)
+        logger.info(f"📋 Accessible accounts: {len(accessible)} "
+                     f"(MCCs: {[a['id'] for a in accessible if a.get('manager')]}, "
+                     f"unknown: {[a['id'] for a in accessible if a.get('manager') is None]})")
 
         known_ids = {a["id"] for a in hier}
         merged = list(hier)
@@ -671,12 +717,15 @@ def _active_index(force: bool = False) -> List[Dict[str, Any]]:
                 known_ids.add(a["id"])
 
             if a.get("manager") and a["id"] != root_mcc and USE_HIERARCHY_LOOKUP:
+                logger.info(f"🔎 Walking hierarchy for other MCC: {a['id']} ({a.get('name', '')})")
                 sub_accounts = _walk_mcc_hierarchy(a["id"])
+                logger.info(f"   → Found {len(sub_accounts)} sub-accounts")
                 for sa in sub_accounts:
                     if sa["id"] not in known_ids:
                         merged.append(sa)
                         known_ids.add(sa["id"])
 
+        logger.info(f"📋 Merged index total: {len(merged)} accounts")
         _merged_index_cache["items"] = merged
         _merged_index_cache["at"] = _now_s()
         return merged
@@ -699,9 +748,13 @@ def _resolve_login_customer_id(customer_id: str, explicit: Optional[str] = None)
         if a["id"] == cid:
             stored = a.get("login_cid")
             if stored:
+                logger.info(f"🔑 Resolved login-customer-id for {cid}: {stored}")
                 return stored
-            return normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
+            fallback = normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
+            logger.info(f"🔑 Resolved login-customer-id for {cid}: {fallback} (default MCC)")
+            return fallback
 
+    logger.warning(f"⚠️ Customer {cid} not found in any index — using default MCC")
     return None
 
 # ----------------------------- NAME/ID RESOLUTION -----------------------------
