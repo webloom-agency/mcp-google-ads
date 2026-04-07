@@ -392,6 +392,7 @@ def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict
     Fetch all rows for a GAQL query using googleAds:search pagination.
     Note: For Google Ads API, page size is fixed by the API (10,000).
     Setting pageSize triggers PAGE_SIZE_NOT_SUPPORTED, so we do NOT send it.
+    On 403 USER_PERMISSION_DENIED, auto-retries with a resolved login-customer-id.
     """
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
     results: List[Dict[str, Any]] = []
@@ -403,6 +404,15 @@ def _gaql_search_all(cid: str, query: str, headers: Dict[str, str]) -> List[Dict
             payload["pageToken"] = page_token
 
         r = _google_ads_request("POST", url, headers, json=payload)
+
+        if r.status_code == 403 and "USER_PERMISSION_DENIED" in r.text and not page_token:
+            resolved = _resolve_login_customer_id(cid)
+            if resolved and resolved != headers.get("login-customer-id"):
+                logger.info(f"Retrying with login-customer-id={resolved} for customer {cid}")
+                headers = dict(headers)
+                headers["login-customer-id"] = resolved
+                r = _google_ads_request("POST", url, headers, json=payload)
+
         if r.status_code != 200:
             raise RuntimeError(f"GAQL search error [{r.status_code}]: {r.text}")
 
@@ -537,10 +547,13 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
             rr2 = None
 
         use_resp = None
+        working_login_cid: Optional[str] = None
         if rr and rr.status_code == 200 and rr.json().get("results"):
             use_resp = rr
+            working_login_cid = cid
         elif rr2 and rr2.status_code == 200 and rr2.json().get("results"):
             use_resp = rr2
+            working_login_cid = normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
 
         if use_resp:
             c = use_resp.json()["results"][0].get("customer", {})
@@ -550,6 +563,7 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
                 "manager": bool(c.get("manager", False)),
                 "status": c.get("status", ""),
                 "currency": c.get("currencyCode", ""),
+                "login_cid": working_login_cid,
             })
         else:
             err_txt = ""
@@ -596,6 +610,30 @@ def _active_index(force: bool = False) -> List[Dict[str, Any]]:
         if a["id"] not in known_ids:
             merged.append(a)
     return merged
+
+def _resolve_login_customer_id(customer_id: str, explicit: Optional[str] = None) -> Optional[str]:
+    """
+    Determine the correct login-customer-id for a target customer.
+    If *explicit* is provided (user override), use it.
+    Otherwise check: hierarchy cache → root MCC, accounts cache → stored login_cid.
+    Returns None when the default env MCC should be used.
+    """
+    if explicit:
+        return normalize_login_customer_id(explicit)
+
+    cid = normalize_customer_id(customer_id)
+
+    for a in _hierarchy_cache.get("items", []):
+        if a["id"] == cid:
+            return normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
+
+    for a in _accounts_cache.get("items", []):
+        if a["id"] == cid:
+            stored = a.get("login_cid")
+            if stored:
+                return stored
+
+    return None
 
 # ----------------------------- NAME/ID RESOLUTION -----------------------------
 def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
@@ -1149,7 +1187,7 @@ async def execute_gaql_query(
     try:
         creds = get_credentials()
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-        headers = get_headers(creds, login_customer_id=login_customer_id)
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
         # Auto-adjust change_event queries for API restrictions
         adjusted_query = _adjust_change_event_query(query)
@@ -1253,7 +1291,7 @@ async def get_campaign_performance(
         try:
             creds = get_credentials()
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-            headers = get_headers(creds, login_customer_id=login_customer_id)
+            headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
             rows = _gaql_search_all(cid, query, headers)
             if not rows:
@@ -1340,7 +1378,7 @@ async def get_ad_performance(
         try:
             creds = get_credentials()
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-            headers = get_headers(creds, login_customer_id=login_customer_id)
+            headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
             rows = _gaql_search_all(cid, query, headers)
             if not rows:
@@ -1435,7 +1473,7 @@ async def get_keyword_performance(
         try:
             creds = get_credentials()
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-            headers = get_headers(creds, login_customer_id=login_customer_id)
+            headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
             rows = _gaql_search_all(cid, query, headers)
             if not rows:
@@ -1496,7 +1534,7 @@ async def get_campaign_budgets(
         try:
             creds = get_credentials()
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-            headers = get_headers(creds, login_customer_id=login_customer_id)
+            headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
             rows = _gaql_search_all(cid, query, headers)
             if not rows:
@@ -1978,7 +2016,7 @@ async def get_search_terms(
         # --- Fetch from API ---
         try:
             creds = get_credentials()
-            headers = get_headers(creds, login_customer_id=login_customer_id)
+            headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
             # 1) Standard search_term_view (Search + Shopping)
             query = _build_search_terms_query(days, order_by, status_filter, min_impressions, min_cost)
@@ -2210,7 +2248,7 @@ async def get_change_history(
         try:
             creds = get_credentials()
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-            headers = get_headers(creds, login_customer_id=login_customer_id)
+            headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
             adjusted_query = _adjust_change_event_query(query)
             rows = _gaql_search_all(cid, adjusted_query, headers)
@@ -2244,7 +2282,7 @@ async def run_gaql(
     try:
         creds = get_credentials()
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-        headers = get_headers(creds, login_customer_id=login_customer_id)
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
         # Auto-adjust change_event queries for API restrictions
         adjusted_query = _adjust_change_event_query(query)
@@ -2392,8 +2430,8 @@ async def get_ad_creatives(
     """
     try:
         creds = get_credentials()
-        headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
         rows = _gaql_search_all(cid, query, headers)
         if not rows:
@@ -2453,19 +2491,14 @@ async def get_account_currency(
             else:
                 raise ValueError("Invalid credentials and no refresh token available")
 
-        headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
-        response = _google_ads_request("POST", url, headers, json={"query": query})
-        if response.status_code != 200:
-            return f"Error retrieving account currency [{response.status_code}]: {response.text}"
-
-        results = response.json()
-        if not results.get('results'):
+        results = _gaql_search_all(cid, query, headers)
+        if not results:
             return "No account information found for this customer."
 
-        customer = results['results'][0].get('customer', {})
+        customer = results[0].get('customer', {})
         currency_code = customer.get('currencyCode', 'Not specified')
         return f"Account {cid} uses currency: {currency_code}"
 
@@ -2494,20 +2527,12 @@ async def get_image_assets(
     """
     try:
         creds = get_credentials()
-        headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
-        # If limit > 0, rely on server-side LIMIT; else fetch all pages
-        if isinstance(limit, int) and limit > 0:
-            response = _google_ads_request("POST", url, headers, json={"query": query})
-            if response.status_code != 200:
-                return f"Error retrieving image assets [{response.status_code}]: {response.text}"
-            rows = response.json().get('results', [])
-        else:
-            # Remove any trailing whitespace-only LIMIT fragment before sending
-            q_no_limit = "\n".join([ln for ln in query.splitlines() if not ln.strip().startswith("LIMIT ")])
-            rows = _gaql_search_all(cid, q_no_limit, headers)
+        if not (isinstance(limit, int) and limit > 0):
+            query = "\n".join([ln for ln in query.splitlines() if not ln.strip().startswith("LIMIT ")])
+        rows = _gaql_search_all(cid, query, headers)
 
         if not rows:
             return "No image assets found for this customer."
@@ -2551,19 +2576,14 @@ async def download_image_asset(
     """
     try:
         creds = get_credentials()
-        headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
-        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}/googleAds:search"
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
-        resp = _google_ads_request("POST", url, headers, json={"query": query})
-        if resp.status_code != 200:
-            return f"Error retrieving image asset [{resp.status_code}]: {resp.text}"
-
-        results = resp.json()
-        if not results.get('results'):
+        results = _gaql_search_all(cid, query, headers)
+        if not results:
             return f"No image asset found with ID {asset_id}"
 
-        asset = results['results'][0].get('asset', {})
+        asset = results[0].get('asset', {})
         image_url = asset.get('imageAsset', {}).get('fullSize', {}).get('url')
         asset_name = asset.get('name', f"image_{asset_id}")
 
@@ -2611,8 +2631,8 @@ async def get_asset_usage(
 
     try:
         creds = get_credentials()
-        headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
         assets_rows = _gaql_search_all(cid, assets_query, headers)
         if not assets_rows:
@@ -2691,8 +2711,8 @@ async def analyze_image_assets(
     """
     try:
         creds = get_credentials()
-        headers = get_headers(creds, login_customer_id=login_customer_id)
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
         rows = _gaql_search_all(cid, query, headers)
         if not rows:
