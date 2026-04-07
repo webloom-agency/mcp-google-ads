@@ -616,12 +616,17 @@ def _resolve_login_customer_id(customer_id: str, explicit: Optional[str] = None)
     Determine the correct login-customer-id for a target customer.
     If *explicit* is provided (user override), use it.
     Otherwise check: hierarchy cache → root MCC, accounts cache → stored login_cid.
+    Populates caches on first call if needed.
     Returns None when the default env MCC should be used.
     """
     if explicit:
         return normalize_login_customer_id(explicit)
 
     cid = normalize_customer_id(customer_id)
+
+    # Ensure caches are populated (lazy init via _active_index)
+    if not _hierarchy_cache.get("items") and not _accounts_cache.get("items"):
+        _active_index()
 
     for a in _hierarchy_cache.get("items", []):
         if a["id"] == cid:
