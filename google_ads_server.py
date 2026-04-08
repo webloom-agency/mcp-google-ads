@@ -2158,9 +2158,10 @@ async def get_search_terms(
             query = _build_search_terms_query(days, order_by, status_filter, min_impressions, min_cost)
             logger.info(f"🔍 Fetching search terms for {cid} (days={days}, min_cost={min_cost})...")
             rows = _gaql_search_all(cid, query, headers)
-            # Tag standard rows with source
+            # Tag rows with source based on campaign channel type
             for r in rows:
-                r["_source"] = "SEARCH"
+                ch = r.get("campaign", {}).get("advertisingChannelType", "")
+                r["_source"] = "SHOPPING" if ch == "SHOPPING" else "SEARCH"
 
             # 2) DSA search terms
             if include_dsa:
@@ -2308,7 +2309,7 @@ async def get_search_terms(
     if len(by_source) > 1:  # Only show if there are multiple sources
         lines.append("📡 BY SOURCE:")
         lines.append("")
-        source_labels = {"SEARCH": "Search/Shopping", "DSA": "Dynamic Search Ads", "PMAX": "Performance Max"}
+        source_labels = {"SEARCH": "Search", "SHOPPING": "Shopping", "DSA": "Dynamic Search Ads", "PMAX": "Performance Max"}
         for src, data in by_source.items():
             label = source_labels.get(src, src)
             lines.append(f"   {label}: {data['count']} rows | {data['clicks']} clicks | {data['impressions']:,} impressions | ${data['cost']:,.2f} cost")
