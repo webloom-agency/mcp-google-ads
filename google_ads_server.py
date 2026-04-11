@@ -59,7 +59,7 @@ if 'mcp.server.transport_security' not in sys.modules:
     print("✓ Pre-patched transport_security module before MCP import (v2 - with validate_request)")
 
 # MCP
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # ----------------------------- LOGGING -----------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -118,6 +118,37 @@ else:
     logger.info("✅ Transport security patch block completed without exceptions")
 
 # ----------------------------- MCP APP -----------------------------
+from starlette.middleware import Middleware as _StarletteMiddleware
+
+# Per-user OAuth 2.1 support (opt-in via MCP_ENABLE_OAUTH21)
+_OAUTH21_ENABLED = os.getenv("MCP_ENABLE_OAUTH21", "").lower() in ("1", "true", "yes")
+_auth_provider_instance = None
+
+def _init_oauth21():
+    """Initialize OAuth 2.1 auth provider if enabled and available."""
+    global _auth_provider_instance
+    if not _OAUTH21_ENABLED:
+        logger.info("OAuth 2.1 disabled (set MCP_ENABLE_OAUTH21=true to enable per-user auth)")
+        return None
+    try:
+        from auth.oauth_config import get_oauth_config
+        from auth.google_oauth_provider import GoogleOAuthProvider
+
+        config = get_oauth_config()
+        if not config.is_configured():
+            logger.warning("OAuth 2.1 enabled but GOOGLE_OAUTH_CLIENT_ID / GOOGLE_ADS_CLIENT_ID not set")
+            return None
+
+        base_url = config.get_oauth_base_url()
+        _auth_provider_instance = GoogleOAuthProvider(base_url=base_url)
+        logger.info("OAuth 2.1 per-user authentication initialized (OAuthProvider)")
+        return _auth_provider_instance
+    except Exception as e:
+        logger.error(f"Failed to initialize OAuth 2.1: {e}", exc_info=True)
+        return None
+
+_oauth21_provider = _init_oauth21()
+
 mcp = FastMCP(
     "google-ads-server",
     dependencies=[
@@ -125,8 +156,19 @@ mcp = FastMCP(
         "google-auth",
         "requests",
         "python-dotenv"
-    ]
+    ],
+    auth=_oauth21_provider,
 )
+
+# Register AuthInfoMiddleware when OAuth 2.1 is active
+if _OAUTH21_ENABLED and _oauth21_provider:
+    try:
+        from auth.auth_info_middleware import AuthInfoMiddleware
+        _auth_info_mw = AuthInfoMiddleware()
+        mcp.add_middleware(_auth_info_mw)
+        logger.info("AuthInfoMiddleware registered for per-user auth")
+    except Exception as e:
+        logger.warning(f"Could not register AuthInfoMiddleware: {e}")
 
 # ----------------------------- CONSTANTS -----------------------------
 SCOPES = ['https://www.googleapis.com/auth/adwords']
@@ -226,12 +268,70 @@ def normalize_login_customer_id(value: Optional[str]) -> Optional[str]:
         raise ValueError(f"Invalid login_customer_id: {value!r}. Expected 10 digits.")
     return digits
 
-def get_credentials():
+def _get_user_email() -> Optional[str]:
     """
-    Get credentials based on GOOGLE_ADS_AUTH_TYPE.
-    - service_account: requires GOOGLE_ADS_CREDENTIALS_PATH (SA JSON)
-    - oauth: prefer env-based refresh-token; else token file; else interactive (local only)
+    Extract the authenticated user's email from FastMCP context.
+    Returns None when OAuth 2.1 is not active or no user is authenticated
+    (falls back to legacy single-credential mode).
     """
+    if not _OAUTH21_ENABLED:
+        return None
+    try:
+        from fastmcp.server.dependencies import get_context
+        ctx = get_context()
+        if ctx:
+            email = ctx.get_state("authenticated_user_email")
+            if email:
+                return email
+    except Exception:
+        pass
+    return None
+
+
+def get_credentials_for_user(user_email: str) -> Optional[Credentials]:
+    """
+    Get per-user Google credentials from the on-disk credential store.
+    The OAuthProvider stores Google credentials to disk during the OAuth callback;
+    this function retrieves and refreshes them for API calls.
+    """
+    try:
+        from auth.credential_store import get_credential_store
+        cred_store = get_credential_store()
+        creds = cred_store.get_credential(user_email)
+        if creds:
+            if not creds.valid and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+                try:
+                    creds.refresh(Request())
+                    cred_store.store_credential(user_email, creds)
+                except Exception as e:
+                    logger.warning(f"Failed to refresh stored credentials for {user_email}: {e}")
+            if creds.valid or creds.token:
+                logger.debug(f"Using per-user credentials for {user_email}")
+                return creds
+    except Exception as e:
+        logger.debug(f"Credential store lookup failed for {user_email}: {e}")
+
+    return None
+
+
+def get_credentials(user_email: Optional[str] = None):
+    """
+    Get credentials based on auth mode.
+
+    When OAuth 2.1 is enabled and user_email is provided, returns per-user credentials.
+    Otherwise falls back to legacy single-credential mode (env vars / token file / interactive).
+    """
+    # Per-user path: OAuth 2.1 with authenticated user
+    if user_email and _OAUTH21_ENABLED:
+        creds = get_credentials_for_user(user_email)
+        if creds:
+            return creds
+        raise ValueError(
+            f"No credentials found for user {user_email}. "
+            "Please authenticate via the OAuth 2.1 flow first."
+        )
+
+    # Legacy single-credential path
     auth_type = GOOGLE_ADS_AUTH_TYPE.lower()
     logger.info(f"Using authentication type: {auth_type}")
 
@@ -501,7 +601,7 @@ def get_full_hierarchy_index(
         return _hierarchy_cache["items"]
 
     root_id = normalize_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
-    creds = get_credentials()
+    creds = get_credentials(_get_user_email())
     headers = get_headers(creds, login_customer_id=root_id)
 
     where_status = "" if include_hidden else " AND customer_client.status = 'ENABLED'"
@@ -563,7 +663,7 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     ):
         return _accounts_cache["items"]
 
-    creds_root = get_credentials()
+    creds_root = get_credentials(_get_user_email())
     headers_root = get_headers(creds_root)
     url = f"https://googleads.googleapis.com/{API_VERSION}/customers:listAccessibleCustomers"
     r = _google_ads_request("GET", url, headers_root)
@@ -590,7 +690,7 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
 
         # Attempt 1: login_customer_id = cid
         try:
-            headers_1 = get_headers(get_credentials(), login_customer_id=cid)
+            headers_1 = get_headers(get_credentials(_get_user_email()), login_customer_id=cid)
             rr = _google_ads_request("POST", u, headers_1, json={"query": q})
         except Exception:
             rr = None
@@ -598,7 +698,7 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
         # Attempt 2: fallback to env MCC
         if not rr or rr.status_code != 200 or not rr.json().get("results"):
             try:
-                headers_2 = get_headers(get_credentials())  # uses env MCC
+                headers_2 = get_headers(get_credentials(_get_user_email()))  # uses env MCC
                 rr2 = _google_ads_request("POST", u, headers_2, json={"query": q})
             except Exception:
                 rr2 = None
@@ -662,7 +762,7 @@ def _walk_mcc_hierarchy(mcc_id: str) -> List[Dict[str, Any]]:
         ORDER BY customer_client.level, customer_client.descriptive_name
     """.strip()
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         headers = get_headers(creds, login_customer_id=mcc_id)
         rows = _gaql_search_all(mcc_id, query, headers)
     except Exception as e:
@@ -982,7 +1082,7 @@ async def list_accounts_hierarchy(
     """
     try:
         root_id = coerce_customer_id(root, prefer_non_manager=False) if root else normalize_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         headers = get_headers(creds, login_customer_id=root_id)
 
         status_filter = "" if include_hidden else " AND customer_client.status = 'ENABLED'"
@@ -1047,7 +1147,7 @@ async def list_manager_clients(
     """
     try:
         root_id = coerce_customer_id(manager_id, prefer_non_manager=False)
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         headers = get_headers(creds, login_customer_id=root_id)
 
         where_status = "" if not enabled_only else " AND customer_client.status = 'ENABLED'"
@@ -1321,7 +1421,7 @@ async def execute_gaql_query(
     Returns up to max_results (default 100). Use run_gaql for more formatting options.
     """
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
@@ -1425,7 +1525,7 @@ async def get_campaign_performance(
     # For summary format, fetch ALL data and summarize
     if format == "summary":
         try:
-            creds = get_credentials()
+            creds = get_credentials(_get_user_email())
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
             headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
@@ -1512,7 +1612,7 @@ async def get_ad_performance(
     # For summary format, fetch ALL data and summarize
     if format == "summary":
         try:
-            creds = get_credentials()
+            creds = get_credentials(_get_user_email())
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
             headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
@@ -1607,7 +1707,7 @@ async def get_keyword_performance(
     # For summary format, fetch ALL data and summarize  
     if format == "summary":
         try:
-            creds = get_credentials()
+            creds = get_credentials(_get_user_email())
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
             headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
@@ -1668,7 +1768,7 @@ async def get_campaign_budgets(
     # For summary format, fetch ALL and summarize
     if format == "summary":
         try:
-            creds = get_credentials()
+            creds = get_credentials(_get_user_email())
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
             headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
@@ -2151,7 +2251,7 @@ async def get_search_terms(
     else:
         # --- Fetch from API ---
         try:
-            creds = get_credentials()
+            creds = get_credentials(_get_user_email())
             headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
             # 1) Standard search_term_view (Search + Shopping)
@@ -2383,7 +2483,7 @@ async def get_change_history(
     # For summary format, fetch data and summarize
     if format == "summary":
         try:
-            creds = get_credentials()
+            creds = get_credentials(_get_user_email())
             cid = coerce_customer_id(customer_id, prefer_non_manager=True)
             headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
             
@@ -2417,7 +2517,7 @@ async def run_gaql(
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
@@ -2566,7 +2666,7 @@ async def get_ad_creatives(
         ORDER BY campaign.name, ad_group.name
     """
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
@@ -2621,7 +2721,7 @@ async def get_account_currency(
         LIMIT 1
     """
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         if not creds.valid:
             if getattr(creds, 'refresh_token', None):
                 creds.refresh(Request())
@@ -2663,7 +2763,7 @@ async def get_image_assets(
         {f"LIMIT {limit}" if isinstance(limit, int) and limit > 0 else ''}
     """
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
@@ -2712,7 +2812,7 @@ async def download_image_asset(
         LIMIT 1
     """
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
@@ -2767,7 +2867,7 @@ async def get_asset_usage(
     """
 
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
@@ -2847,7 +2947,7 @@ async def analyze_image_assets(
         ORDER BY metrics.impressions DESC
     """
     try:
-        creds = get_credentials()
+        creds = get_credentials(_get_user_email())
         cid = coerce_customer_id(customer_id, prefer_non_manager=True)
         headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
@@ -2972,17 +3072,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
-app = mcp.streamable_http_app()
+app = mcp.http_app()
 
 # Patch transport security AFTER app creation
 try:
-    # Access the transport manager from the app
     if hasattr(app, 'state'):
-        # Find all TransportSecurity instances and disable validation
         for attr_name in dir(app.state):
             attr = getattr(app.state, attr_name, None)
             if attr and hasattr(attr, 'validate_host'):
-                # Monkey-patch the validate_host method on the instance
                 attr.validate_host = lambda host: True
                 logger.info(f"✓ Disabled Host validation on {attr_name}")
             if attr and hasattr(attr, '_transport_security'):
@@ -2994,8 +3091,9 @@ try:
 except Exception as e:
     logger.warning(f"Could not patch app.state: {e}")
 
-# Add Bearer auth enforcement if MCP_BEARER_TOKEN is set
-app.add_middleware(BearerAuthMiddleware)
+# Add Bearer auth enforcement if MCP_BEARER_TOKEN is set (legacy auth, skipped when OAuth 2.1 is active)
+if not (_OAUTH21_ENABLED and _oauth21_provider):
+    app.add_middleware(BearerAuthMiddleware)
 
 # --- CORS for browser-based MCP clients (e.g., bolt.new / webcontainer) ---
 # Allow exact origins and a regex for ephemeral *.webcontainer-api.io subdomains.
