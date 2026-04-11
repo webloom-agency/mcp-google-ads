@@ -265,7 +265,13 @@ class GoogleOAuthProvider(OAuthProvider):
             return None
 
     async def _extract_user_email(self, token_data: dict) -> Optional[str]:
-        """Get user email from id_token or userinfo endpoint."""
+        """
+        Get user email from id_token or userinfo endpoint.
+
+        Signature verification is skipped because the id_token was received
+        directly from Google's token endpoint over TLS in _exchange_google_code(),
+        not from the client. This is a standard server-side OAuth pattern.
+        """
         id_token = token_data.get("id_token")
         if id_token:
             try:
@@ -287,7 +293,9 @@ class GoogleOAuthProvider(OAuthProvider):
                     ) as resp:
                         if resp.status == 200:
                             info = await resp.json()
-                            return info.get("email")
+                            email = info.get("email")
+                            if email and info.get("email_verified", False):
+                                return email
             except Exception as e:
                 logger.debug("userinfo fetch failed: %s", e)
 

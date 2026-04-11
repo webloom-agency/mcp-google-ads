@@ -197,11 +197,47 @@ HIER_CACHE_TTL_SECONDS = int(os.getenv("HIER_CACHE_TTL_SECONDS", "900"))
 # Prefer hierarchy-based lookups for name → ID (recommended for big MCCs)
 USE_HIERARCHY_LOOKUP = os.getenv("USE_HIERARCHY_LOOKUP", "1") not in ("0", "false", "False")
 
-_accounts_cache: Dict[str, Any] = {"at": 0, "items": []}     # listAccessibleCustomers-based (fallback)
-_hierarchy_cache: Dict[str, Any] = {"at": 0, "items": []}    # customer_client-based (full subtree)
-_merged_index_cache: Dict[str, Any] = {"at": 0, "items": []} # merged index (hierarchy + all accessible MCCs)
-_building_active_index: bool = False                          # recursion guard for _active_index
-_search_terms_cache: Dict[str, Any] = {}                     # search terms paginated cache: {cache_key: {"at": int, "rows": [...], "summary": {...}}}
+# Per-user caches: keyed by user email (or "__default__" in legacy single-credential mode).
+# This prevents cross-user data leakage in multi-tenant deployments.
+_accounts_cache: Dict[str, Dict[str, Any]] = {}
+_hierarchy_cache: Dict[str, Dict[str, Any]] = {}
+_merged_index_cache: Dict[str, Dict[str, Any]] = {}
+_building_active_index: Dict[str, bool] = {}
+_search_terms_cache: Dict[str, Dict[str, Any]] = {}
+
+def _cache_key() -> str:
+    """Return the per-user cache key. Isolates caches between users in multi-tenant mode."""
+    return _get_user_email() or "__default__"
+
+def _get_accounts_cache() -> Dict[str, Any]:
+    k = _cache_key()
+    if k not in _accounts_cache:
+        _accounts_cache[k] = {"at": 0, "items": []}
+    return _accounts_cache[k]
+
+def _get_hierarchy_cache() -> Dict[str, Any]:
+    k = _cache_key()
+    if k not in _hierarchy_cache:
+        _hierarchy_cache[k] = {"at": 0, "items": []}
+    return _hierarchy_cache[k]
+
+def _get_merged_index_cache() -> Dict[str, Any]:
+    k = _cache_key()
+    if k not in _merged_index_cache:
+        _merged_index_cache[k] = {"at": 0, "items": []}
+    return _merged_index_cache[k]
+
+def _is_building_active_index() -> bool:
+    return _building_active_index.get(_cache_key(), False)
+
+def _set_building_active_index(val: bool):
+    _building_active_index[_cache_key()] = val
+
+def _get_search_terms_cache() -> Dict[str, Any]:
+    k = _cache_key()
+    if k not in _search_terms_cache:
+        _search_terms_cache[k] = {}
+    return _search_terms_cache[k]
 
 # ----------------------------- HELPERS -----------------------------
 def _now_s() -> int:
@@ -498,7 +534,7 @@ def _get_known_mcc_ids() -> List[str]:
     root = normalize_login_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
     if root:
         mccs.append(root)
-    for cache in (_accounts_cache, _hierarchy_cache, _merged_index_cache):
+    for cache in (_get_accounts_cache(), _get_hierarchy_cache(), _get_merged_index_cache()):
         for a in cache.get("items", []):
             aid = a.get("id", "")
             mgr = a.get("manager")
@@ -593,12 +629,13 @@ def get_full_hierarchy_index(
     Returns the FULL subtree under the umbrella MCC in env (GOOGLE_ADS_LOGIN_CUSTOMER_ID),
     using customer_client. Much more complete than listAccessibleCustomers.
     """
+    hcache = _get_hierarchy_cache()
     if (
         not force
-        and _hierarchy_cache["items"]
-        and _now_s() - _hierarchy_cache["at"] < HIER_CACHE_TTL_SECONDS
+        and hcache["items"]
+        and _now_s() - hcache["at"] < HIER_CACHE_TTL_SECONDS
     ):
-        return _hierarchy_cache["items"]
+        return hcache["items"]
 
     root_id = normalize_customer_id(GOOGLE_ADS_LOGIN_CUSTOMER_ID)
     creds = get_credentials(_get_user_email())
@@ -622,7 +659,6 @@ def get_full_hierarchy_index(
     try:
         rows = _gaql_search_all(root_id, query, headers)
     except Exception as e:
-        # Fallback: return empty (caller can fallback to listAccessibleCustomers)
         logger.error(f"Hierarchy GAQL failed: {e}")
         rows = []
 
@@ -647,8 +683,8 @@ def get_full_hierarchy_index(
             "login_cid": root_id,
         })
 
-    _hierarchy_cache["items"] = items
-    _hierarchy_cache["at"] = _now_s()
+    hcache["items"] = items
+    hcache["at"] = _now_s()
     return items
 
 def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
@@ -656,12 +692,13 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
     Fallback (listAccessibleCustomers + per-customer name fetch).
     Kept for completeness if you disable hierarchy lookup.
     """
+    acache = _get_accounts_cache()
     if (
         not force
-        and _accounts_cache["items"]
-        and _now_s() - _accounts_cache["at"] < ACCOUNTS_CACHE_TTL_SECONDS
+        and acache["items"]
+        and _now_s() - acache["at"] < ACCOUNTS_CACHE_TTL_SECONDS
     ):
-        return _accounts_cache["items"]
+        return acache["items"]
 
     creds_root = get_credentials(_get_user_email())
     headers_root = get_headers(creds_root)
@@ -742,8 +779,8 @@ def get_accounts_index(force: bool = False) -> List[Dict[str, Any]]:
                 "error": err_txt
             })
 
-    _accounts_cache["items"] = items
-    _accounts_cache["at"] = _now_s()
+    acache["items"] = items
+    acache["at"] = _now_s()
     return items
 
 def _walk_mcc_hierarchy(mcc_id: str) -> List[Dict[str, Any]]:
@@ -790,24 +827,25 @@ def _active_index(force: bool = False) -> List[Dict[str, Any]]:
     under OTHER MCCs (not just GOOGLE_ADS_LOGIN_CUSTOMER_ID) are visible.
     Also walks the hierarchy of other accessible MCCs to discover their sub-accounts.
     """
-    global _building_active_index
+    mcache = _get_merged_index_cache()
 
     if (
         not force
-        and _merged_index_cache["items"]
-        and _now_s() - _merged_index_cache["at"] < HIER_CACHE_TTL_SECONDS
+        and mcache["items"]
+        and _now_s() - mcache["at"] < HIER_CACHE_TTL_SECONDS
     ):
-        return _merged_index_cache["items"]
+        return mcache["items"]
 
-    # Recursion guard: if we're already building, return the best partial data
-    if _building_active_index:
-        if _hierarchy_cache.get("items"):
-            return _hierarchy_cache["items"]
-        if _accounts_cache.get("items"):
-            return _accounts_cache["items"]
+    if _is_building_active_index():
+        hcache = _get_hierarchy_cache()
+        if hcache.get("items"):
+            return hcache["items"]
+        acache = _get_accounts_cache()
+        if acache.get("items"):
+            return acache["items"]
         return []
 
-    _building_active_index = True
+    _set_building_active_index(True)
     try:
         if USE_HIERARCHY_LOOKUP:
             hier = get_full_hierarchy_index(force=force, include_managers=True, include_hidden=False, max_level=10)
@@ -840,11 +878,11 @@ def _active_index(force: bool = False) -> List[Dict[str, Any]]:
                         known_ids.add(sa["id"])
 
         logger.info(f"📋 Merged index total: {len(merged)} accounts")
-        _merged_index_cache["items"] = merged
-        _merged_index_cache["at"] = _now_s()
+        mcache["items"] = merged
+        mcache["at"] = _now_s()
         return merged
     finally:
-        _building_active_index = False
+        _set_building_active_index(False)
 
 def _resolve_login_customer_id(customer_id: str, explicit: Optional[str] = None) -> Optional[str]:
     """
@@ -2243,7 +2281,8 @@ async def get_search_terms(
                                          include_dsa=include_dsa, include_pmax=include_pmax)
 
     # --- Check cache ---
-    cached = _search_terms_cache.get(cache_key)
+    st_cache = _get_search_terms_cache()
+    cached = st_cache.get(cache_key)
     if cached and (_now_s() - cached["at"] < SEARCH_TERMS_CACHE_TTL_SECONDS):
         rows = cached["rows"]
         summary = cached["summary"]
@@ -2303,7 +2342,7 @@ async def get_search_terms(
             summary = _compute_search_terms_summary(rows)
 
             # Store in cache
-            _search_terms_cache[cache_key] = {"at": _now_s(), "rows": rows, "summary": summary}
+            st_cache[cache_key] = {"at": _now_s(), "rows": rows, "summary": summary}
             logger.info(f"💾 Cached {len(rows)} search terms for {cache_key}")
         except Exception as e:
             return f"Error getting search terms: {str(e)}"
