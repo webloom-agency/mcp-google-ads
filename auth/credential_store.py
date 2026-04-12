@@ -165,6 +165,18 @@ def get_credential_store() -> CredentialStore:
     return _credential_store
 
 
+def get_credential_storage_directory() -> str:
+    """
+    Resolved credentials directory (same rules as LocalDirectoryCredentialStore).
+    Used for per-user Google tokens and MCP OAuth server state files.
+    """
+    store = get_credential_store()
+    base = getattr(store, "base_dir", None)
+    if isinstance(base, str) and base:
+        return base
+    return LocalDirectoryCredentialStore().base_dir
+
+
 def set_credential_store(store: CredentialStore):
     global _credential_store
     _credential_store = store
