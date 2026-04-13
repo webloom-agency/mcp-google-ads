@@ -1902,9 +1902,30 @@ async def get_campaign_budgets(
 
 def _search_terms_cache_key(cid: str, days: int, order_by: str, status_filter: Optional[str],
                              min_impressions: int, min_cost: float,
-                             include_dsa: bool = True, include_pmax: bool = True) -> str:
+                             include_dsa: bool = True, include_pmax: bool = True,
+                             campaign_filter: Optional[str] = None) -> str:
     """Build a deterministic cache key for search terms queries."""
-    return f"{cid}|{days}|{order_by}|{status_filter or 'ALL'}|mi{min_impressions}|mc{min_cost}|dsa{include_dsa}|pmax{include_pmax}"
+    cf = campaign_filter.strip().lower() if campaign_filter else "ALL"
+    return f"{cid}|{days}|{order_by}|{status_filter or 'ALL'}|mi{min_impressions}|mc{min_cost}|dsa{include_dsa}|pmax{include_pmax}|cf{cf}"
+
+
+def _match_campaign_filter(campaign_name: str, campaign_filter: str) -> bool:
+    """Check if a campaign name matches the filter. Case-insensitive.
+    Supports: exact name, comma-separated names, or wildcard (*) substring match.
+    """
+    name_lower = (campaign_name or "").lower()
+    parts = [p.strip().lower() for p in campaign_filter.split(",") if p.strip()]
+
+    for pattern in parts:
+        if "*" in pattern:
+            # Wildcard matching: *shopping* → contains 'shopping'
+            regex = re.escape(pattern).replace(r"\*", ".*")
+            if re.fullmatch(regex, name_lower):
+                return True
+        else:
+            if name_lower == pattern:
+                return True
+    return False
 
 
 
@@ -2246,6 +2267,7 @@ async def get_search_terms(
     format: str = Field(default="json", description="'json' (default - all rows as flat JSON for export), 'summary' (aggregates + top N detailed rows)"),
     min_impressions: int = Field(default=0, description="Minimum impressions filter (default 0)"),
     min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
+    campaign_filter: Optional[str] = Field(default=None, description="Filter by campaign name. Supports: single name ('Shopping FR'), multiple names comma-separated ('Shopping FR,Shopping EN'), or substring match with * wildcard ('*shopping*' matches any campaign containing 'shopping'). Case-insensitive."),
     include_dsa: bool = Field(default=True, description="Include Dynamic Search Ads search terms (from dynamic_search_ads_search_term_view)"),
     include_pmax: bool = Field(default=True, description="Include Performance Max search terms (individual terms from campaign_search_term_view, with full metrics including cost)"),
     fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include per row (e.g. 'search_term,source,campaign,impressions,clicks,conversions,cpa,cost'). None = all fields. Available: search_term, source, status, match_type, campaign, channel_type, ad_group, impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value, conv_rate, cpa, roas"),
@@ -2278,7 +2300,8 @@ async def get_search_terms(
         return f"Error resolving customer ID: {str(e)}"
 
     cache_key = _search_terms_cache_key(cid, days, order_by, status_filter, min_impressions, min_cost,
-                                         include_dsa=include_dsa, include_pmax=include_pmax)
+                                         include_dsa=include_dsa, include_pmax=include_pmax,
+                                         campaign_filter=campaign_filter)
 
     # --- Check cache ---
     st_cache = _get_search_terms_cache()
@@ -2338,6 +2361,15 @@ async def get_search_terms(
             }
             sort_fn = order_key_map.get(order_by.lower(), order_key_map["cost"])
             rows.sort(key=sort_fn, reverse=True)
+
+            # Apply campaign name filter (post-query, works across all sources)
+            if campaign_filter:
+                rows = [r for r in rows if _match_campaign_filter(
+                    r.get("campaign", {}).get("name", ""), campaign_filter
+                )]
+                if not rows:
+                    return f"No search terms found matching campaign filter '{campaign_filter}'."
+                logger.info(f"🔍 Campaign filter '{campaign_filter}' → {len(rows)} rows remaining")
 
             summary = _compute_search_terms_summary(rows)
 
