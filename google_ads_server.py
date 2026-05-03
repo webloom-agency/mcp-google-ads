@@ -1578,7 +1578,7 @@ async def get_campaign_performance(
             return f"Error getting campaign performance: {str(e)}"
     
     # For other formats (table, json, csv, compact), limit results for performance
-    return await run_gaql(
+    return await _run_gaql_impl(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
         format=format,
@@ -1665,7 +1665,7 @@ async def get_ad_performance(
             return f"Error getting ad performance: {str(e)}"
     
     # For other formats (table, json, csv, compact), limit results for performance
-    return await run_gaql(
+    return await _run_gaql_impl(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
         format=format,
@@ -1760,7 +1760,7 @@ async def get_keyword_performance(
             return f"Error getting keyword performance: {str(e)}"
     
     # For other formats (table, json, csv, compact), limit results for performance
-    return await run_gaql(
+    return await _run_gaql_impl(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
         format=format,
@@ -1891,7 +1891,7 @@ async def get_campaign_budgets(
             return f"Error getting campaign budgets: {str(e)}"
     
     # For other formats
-    return await run_gaql(
+    return await _run_gaql_impl(
         customer_id=customer_id,
         query=query + f" LIMIT {max_results}",
         format=format,
@@ -2569,7 +2569,7 @@ async def get_change_history(
             return f"Error getting change history: {str(e)}"
     
     # For other formats, use run_gaql
-    return await run_gaql(
+    return await _run_gaql_impl(
         customer_id=customer_id,
         query=query,
         format=format,
@@ -2578,14 +2578,13 @@ async def get_change_history(
         login_customer_id=login_customer_id
     )
 
-@mcp.tool()
-async def run_gaql(
-    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
-    format: str = Field(default="table", description="Output format: 'table', 'json', 'csv', 'compact', or 'summary'"),
-    max_results: Optional[int] = Field(default=None, description="Maximum number of results to return (truncates output). None = all results"),
-    fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include (e.g., 'id,name,status'). None = all fields"),
-    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
+async def _run_gaql_impl(
+    customer_id: str,
+    query: str,
+    format: str = "table",
+    max_results: Optional[int] = None,
+    fields: Optional[str] = None,
+    login_customer_id: Optional[str] = None,
 ) -> str:
     try:
         creds = get_credentials(_get_user_email())
@@ -2715,6 +2714,26 @@ async def run_gaql(
 
     except Exception as e:
         return f"Error executing GAQL query: {str(e)}"
+
+
+@mcp.tool()
+async def run_gaql(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
+    query: str = Field(description="Valid GAQL query string following Google Ads Query Language syntax"),
+    format: str = Field(default="table", description="Output format: 'table', 'json', 'csv', 'compact', or 'summary'"),
+    max_results: Optional[int] = Field(default=None, description="Maximum number of results to return (truncates output). None = all results"),
+    fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include (e.g., 'id,name,status'). None = all fields"),
+    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override"),
+) -> str:
+    return await _run_gaql_impl(
+        customer_id=customer_id,
+        query=query,
+        format=format,
+        max_results=max_results,
+        fields=fields,
+        login_customer_id=login_customer_id,
+    )
+
 
 @mcp.tool()
 async def get_ad_creatives(
