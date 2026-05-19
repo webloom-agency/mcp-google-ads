@@ -1,5 +1,54 @@
-from typing import Any, Dict, List, Optional
-from pydantic import Field
+from typing import Annotated, Any, Dict, List, Optional
+from pydantic import BeforeValidator, Field
+
+
+def _coerce_int(v: Any) -> Any:
+    """Coerce string inputs like '30' or '30.0' to int; pass through everything else."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return v
+        try:
+            return int(s)
+        except ValueError:
+            try:
+                return int(float(s))
+            except ValueError:
+                return v
+    return v
+
+
+def _coerce_float(v: Any) -> Any:
+    """Coerce string inputs like '1.5' or '1,5' to float; pass through everything else."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().replace(",", ".")
+        if s == "":
+            return v
+        try:
+            return float(s)
+        except ValueError:
+            return v
+    return v
+
+
+def _coerce_bool(v: Any) -> Any:
+    """Coerce string inputs like 'true'/'false'/'1'/'0' to bool; pass through everything else."""
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "y", "on"):
+            return True
+        if s in ("false", "0", "no", "n", "off"):
+            return False
+    return v
+
+
+CoercedInt = Annotated[int, BeforeValidator(_coerce_int)]
+CoercedFloat = Annotated[float, BeforeValidator(_coerce_float)]
+CoercedBool = Annotated[bool, BeforeValidator(_coerce_bool)]
 import os
 import json
 import requests
@@ -1035,8 +1084,8 @@ def coerce_customer_id(identifier: str, prefer_non_manager: bool = True) -> str:
 # ----------------------------- TOOLS -----------------------------
 @mcp.tool()
 async def list_accounts(
-    force_refresh: bool = Field(default=False, description="Refresh the cache"),
-    use_hierarchy: bool = Field(default=True, description="If true, list from the full hierarchy under the umbrella MCC")
+    force_refresh: CoercedBool = Field(default=False, description="Refresh the cache"),
+    use_hierarchy: CoercedBool = Field(default=True, description="If true, list from the full hierarchy under the umbrella MCC")
 ) -> str:
     """
     Lists accessible accounts with name, ID, MCC flag, and currency.
@@ -1066,7 +1115,7 @@ async def list_accounts(
 @mcp.tool()
 async def find_account(
     query: str = Field(description="Account name (partial) or ID"),
-    top_k: int = Field(default=5, ge=1, le=20, description="Max results to return")
+    top_k: CoercedInt = Field(default=5, ge=1, le=20, description="Max results to return")
 ) -> str:
     """
     Fuzzy-search accounts by name or normalize an ID (using full hierarchy index).
@@ -1111,9 +1160,9 @@ async def find_account(
 @mcp.tool()
 async def list_accounts_hierarchy(
     root: str = Field(default="", description="MCC name or ID to start from. Empty = env GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
-    max_level: int = Field(default=10, ge=1, le=10, description="Depth to traverse (1..10)"),
-    include_managers: bool = Field(default=True, description="Include MCCs in the output"),
-    include_hidden: bool = Field(default=False, description="Include CANCELLED/UNSPECIFIED statuses")
+    max_level: CoercedInt = Field(default=10, ge=1, le=10, description="Depth to traverse (1..10)"),
+    include_managers: CoercedBool = Field(default=True, description="Include MCCs in the output"),
+    include_hidden: CoercedBool = Field(default=False, description="Include CANCELLED/UNSPECIFIED statuses")
 ) -> str:
     """
     Lists the account hierarchy from a manager (MCC) using customer_client.
@@ -1177,8 +1226,8 @@ async def list_accounts_hierarchy(
 @mcp.tool()
 async def list_manager_clients(
     manager_id: str = Field(description="MCC ID or name (e.g., 879-804-8996)"),
-    level: int = Field(default=1, ge=0, le=10, description="Depth to include (0=self only, 1=direct children, ... )"),
-    enabled_only: bool = Field(default=True, description="Only include ENABLED accounts")
+    level: CoercedInt = Field(default=1, ge=0, le=10, description="Depth to include (0=self only, 1=direct children, ... )"),
+    enabled_only: CoercedBool = Field(default=True, description="Only include ENABLED accounts")
 ) -> str:
     """
     Lists client accounts under the given MCC using customer_client.
@@ -1508,8 +1557,8 @@ async def execute_gaql_query(
 @mcp.tool()
 async def get_campaign_performance(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
-    max_results: int = Field(default=50, description="Max campaigns to show in detail (default 50). Aggregates include ALL campaigns"),
+    days: CoercedInt = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    max_results: CoercedInt = Field(default=50, description="Max campaigns to show in detail (default 50). Aggregates include ALL campaigns"),
     order_by: str = Field(default="cost", description="Sort by: 'cost', 'conversions', 'clicks', 'impressions', or 'name'"),
     status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
     format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'compact', 'csv', 'json'"),
@@ -1590,12 +1639,12 @@ async def get_campaign_performance(
 @mcp.tool()
 async def get_ad_performance(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
-    max_results: int = Field(default=50, description="Max ads to show in detail (default 50). Aggregates include ALL ads"),
+    days: CoercedInt = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    max_results: CoercedInt = Field(default=50, description="Max ads to show in detail (default 50). Aggregates include ALL ads"),
     order_by: str = Field(default="impressions", description="Sort by: 'impressions', 'clicks', 'conversions', 'cost', or 'ctr'"),
     status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
     format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'compact', 'csv', 'json'"),
-    min_impressions: int = Field(default=0, description="Minimum impressions filter (default 0)"),
+    min_impressions: CoercedInt = Field(default=0, description="Minimum impressions filter (default 0)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
@@ -1677,13 +1726,13 @@ async def get_ad_performance(
 @mcp.tool()
 async def get_keyword_performance(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
-    max_results: int = Field(default=50, description="Max keywords to show in detail (default 50). Aggregates include ALL keywords"),
+    days: CoercedInt = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    max_results: CoercedInt = Field(default=50, description="Max keywords to show in detail (default 50). Aggregates include ALL keywords"),
     order_by: str = Field(default="impressions", description="Sort by: 'impressions', 'clicks', 'conversions', 'cost', 'ctr', 'quality_score'"),
     status_filter: str = Field(default="ENABLED", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
     match_type: Optional[str] = Field(default=None, description="Filter by match type: 'EXACT', 'PHRASE', 'BROAD', or None for all"),
     format: str = Field(default="summary", description="'summary' (default - aggregates+top N), 'table', 'compact', 'csv', 'json'"),
-    min_impressions: int = Field(default=10, description="Minimum impressions filter (default 10 to exclude low-volume keywords)"),
+    min_impressions: CoercedInt = Field(default=10, description="Minimum impressions filter (default 10 to exclude low-volume keywords)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
@@ -1774,7 +1823,7 @@ async def get_campaign_budgets(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
     status_filter: str = Field(default="ALL", description="Filter by status: 'ENABLED', 'PAUSED', 'REMOVED', or 'ALL'"),
     format: str = Field(default="summary", description="'summary' (default - aggregates+breakdown), 'table', 'json'"),
-    max_results: int = Field(default=50, description="Max campaigns to show in detail (default 50)"),
+    max_results: CoercedInt = Field(default=50, description="Max campaigns to show in detail (default 50)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
@@ -2260,18 +2309,18 @@ def _get_account_name(cid: str) -> str:
 @mcp.tool()
 async def get_search_terms(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
-    max_results: int = Field(default=0, description="Max search terms to return. 0 = ALL (no limit). For summary format, controls how many detailed rows are shown."),
+    days: CoercedInt = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    max_results: CoercedInt = Field(default=0, description="Max search terms to return. 0 = ALL (no limit). For summary format, controls how many detailed rows are shown."),
     order_by: str = Field(default="cost", description="Sort by: 'cost', 'clicks', 'conversions', 'impressions'"),
     status_filter: Optional[str] = Field(default=None, description="Filter by status: 'ADDED', 'EXCLUDED', 'NONE', or None for all"),
     format: str = Field(default="json", description="'json' (default - all rows as flat JSON for export), 'summary' (aggregates + top N detailed rows)"),
-    min_impressions: int = Field(default=0, description="Minimum impressions filter (default 0)"),
-    min_cost: float = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
+    min_impressions: CoercedInt = Field(default=0, description="Minimum impressions filter (default 0)"),
+    min_cost: CoercedFloat = Field(default=0, description="Minimum cost filter in account currency (e.g. 1.0 = 1 EUR/USD). 0 = no filter"),
     campaign_filter: Optional[str] = Field(default=None, description="Filter by campaign name. Supports: single name ('Shopping FR'), multiple names comma-separated ('Shopping FR,Shopping EN'), or substring match with * wildcard ('*shopping*' matches any campaign containing 'shopping'). Case-insensitive."),
-    include_dsa: bool = Field(default=True, description="Include Dynamic Search Ads search terms (from dynamic_search_ads_search_term_view)"),
-    include_pmax: bool = Field(default=True, description="Include Performance Max search terms (individual terms from campaign_search_term_view, with full metrics including cost)"),
+    include_dsa: CoercedBool = Field(default=True, description="Include Dynamic Search Ads search terms (from dynamic_search_ads_search_term_view)"),
+    include_pmax: CoercedBool = Field(default=True, description="Include Performance Max search terms (individual terms from campaign_search_term_view, with full metrics including cost)"),
     fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include per row (e.g. 'search_term,source,campaign,impressions,clicks,conversions,cpa,cost'). None = all fields. Available: search_term, source, status, match_type, campaign, channel_type, ad_group, impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value, conv_rate, cpa, roas"),
-    include_summary: bool = Field(default=True, description="Include summary/aggregates in JSON output. Set false for minimal output."),
+    include_summary: CoercedBool = Field(default=True, description="Include summary/aggregates in JSON output. Set false for minimal output."),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
@@ -2504,12 +2553,12 @@ async def get_search_terms(
 @mcp.tool()
 async def get_change_history(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    days: int = Field(default=7, description="Number of days to look back (max 29)"),
+    days: CoercedInt = Field(default=7, description="Number of days to look back (max 29)"),
     resource_type: Optional[str] = Field(default=None, description="Filter by resource type (e.g., 'CAMPAIGN', 'AD_GROUP', 'AD')"),
     operation: Optional[str] = Field(default=None, description="Filter by operation (e.g., 'CREATE', 'UPDATE', 'REMOVE')"),
     format: str = Field(default="summary", description="Output format: 'summary' (default), 'table', 'compact', or 'json'"),
-    max_results: int = Field(default=500, description="Maximum number of events to fetch (default 500)"),
-    max_detail: int = Field(default=50, description="Max events to show in detail if format=table/compact (default 50)"),
+    max_results: CoercedInt = Field(default=500, description="Maximum number of events to fetch (default 500)"),
+    max_detail: CoercedInt = Field(default=50, description="Max events to show in detail if format=table/compact (default 50)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     """
@@ -2836,7 +2885,7 @@ async def get_account_currency(
 @mcp.tool()
 async def get_image_assets(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    limit: int = Field(default=0, description="Maximum number of image assets to return (0 = no limit)"),
+    limit: CoercedInt = Field(default=0, description="Maximum number of image assets to return (0 = no limit)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     query = f"""
@@ -3011,7 +3060,7 @@ async def get_asset_usage(
 @mcp.tool()
 async def analyze_image_assets(
     customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
+    days: CoercedInt = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
     if days in (7, 14, 30, 60, 90, 180):
