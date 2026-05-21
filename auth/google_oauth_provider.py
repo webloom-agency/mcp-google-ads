@@ -8,6 +8,25 @@ Full OAuth Authorization Server that:
 4. Verifies MCP tokens on each /mcp request
 
 Google tokens NEVER leave the server — the MCP client only sees MCP-issued tokens.
+
+Refresh-token rotation strategy
+-------------------------------
+Refresh tokens are rotated on every use (OAuth 2.1 best practice), but with two
+robustness features layered on top:
+
+* Replay grace window (default 60 s). When a refresh token is rotated, the old
+  token is moved into a replay cache that remembers the successor tokens. If
+  the same old token is presented again within the grace window, the same
+  successor tokens are returned. This makes refresh idempotent and survives
+  network blips, concurrent retries, and lost responses.
+
+* Reuse detection. When a refresh token is presented AFTER the grace window
+  has expired AND we know it was rotated, that's treated as a possible token
+  theft: the entire refresh-token family rooted at the original authorization
+  code is revoked. The legitimate client is forced to re-authorize.
+
+A per-family ``asyncio.Lock`` serializes concurrent refresh attempts so the
+replay cache is observed consistently.
 """
 
 import os
@@ -52,6 +71,7 @@ class _OAuthTokenWithIdToken(OAuthToken):
 DEFAULT_AUTH_CODE_EXPIRY = 5 * 60
 _DEFAULT_ACCESS_TOKEN_TTL = 60 * 60
 _DEFAULT_REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60
+_DEFAULT_REFRESH_GRACE_SECONDS = 60
 
 
 def _int_env(name: str, default: int) -> int:
@@ -59,6 +79,13 @@ def _int_env(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 class GoogleOAuthProvider(OAuthProvider):
@@ -98,41 +125,65 @@ class GoogleOAuthProvider(OAuthProvider):
         self.refresh_token_ttl = max(
             3600, _int_env("MCP_REFRESH_TOKEN_TTL_SECONDS", _DEFAULT_REFRESH_TOKEN_TTL)
         )
-        self._oauth_persist = os.getenv("MCP_OAUTH_STATE_PERSIST", "true").lower() in (
-            "1",
-            "true",
-            "yes",
+        self.refresh_grace_seconds = max(
+            0, _int_env("MCP_REFRESH_TOKEN_GRACE_SECONDS", _DEFAULT_REFRESH_GRACE_SECONDS)
         )
+        self.reuse_detection_enabled = _bool_env(
+            "MCP_REFRESH_TOKEN_REUSE_DETECTION", True
+        )
+        self._oauth_persist = _bool_env("MCP_OAUTH_STATE_PERSIST", True)
         self._oauth_state_path = _oauth_state_store.mcp_oauth_state_path(
             get_credential_storage_directory()
         )
         self._oauth_state_lock = threading.Lock()
 
-        # In-memory stores; clients + tokens also restored from disk when persistence is on
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.access_tokens: dict[str, AccessToken] = {}
         self.refresh_tokens: dict[str, RefreshToken] = {}
 
-        # Mappings: MCP token → user email (to retrieve Google creds)
         self.pending_authorizations: dict[str, dict] = {}
         self.auth_code_to_email: dict[str, str] = {}
         self._auth_code_to_id_token: dict[str, str] = {}
         self._user_id_tokens: dict[str, str] = {}
         self.token_to_email: dict[str, str] = {}
 
+        # Refresh-token rotation bookkeeping
+        # refresh_token_str -> family_id
+        self._refresh_lineage: dict[str, str] = {}
+        # family_id -> {"refresh_tokens": [...], "access_tokens": [...]}
+        self._lineage_index: dict[str, dict[str, list[str]]] = {}
+        # old_refresh_token -> replay entry
+        # {
+        #   "new_access": str, "new_refresh": str,
+        #   "expires_in": int, "scopes": list[str], "id_token": str|None,
+        #   "rotated_at": float, "replay_expires_at": float,
+        #   "family": str, "client_id": str,
+        # }
+        self._replay_cache: dict[str, dict] = {}
+
+        # Lazy per-family locks; created on first use within an event loop.
+        self._family_locks: dict[str, asyncio.Lock] = {}
+
         if self._oauth_persist:
             self._load_oauth_state_from_disk_sync()
 
         logger.info(
             "GoogleOAuthProvider initialized: base_url=%s, google_callback=%s, "
-            "oauth_state_persist=%s, access_ttl=%ss, refresh_ttl=%ss",
+            "oauth_state_persist=%s, access_ttl=%ss, refresh_ttl=%ss, "
+            "refresh_grace=%ss, reuse_detection=%s",
             base_url,
             self.google_callback_uri,
             self._oauth_persist,
             self.access_token_ttl,
             self.refresh_token_ttl,
+            self.refresh_grace_seconds,
+            self.reuse_detection_enabled,
         )
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
 
     def _load_oauth_state_from_disk_sync(self) -> None:
         """Load persisted MCP OAuth state (sync, called from __init__)."""
@@ -140,15 +191,29 @@ class GoogleOAuthProvider(OAuthProvider):
             raw = _oauth_state_store.read_mcp_oauth_state(self._oauth_state_path)
             if not raw:
                 return
-            clients, access_tokens, refresh_tokens, token_to_email = (
-                _oauth_state_store.deserialize_state(raw)
-            )
+            (
+                clients,
+                access_tokens,
+                refresh_tokens,
+                token_to_email,
+                refresh_lineage,
+                lineage_index,
+                replay_cache,
+            ) = _oauth_state_store.deserialize_state(raw)
             self.clients = clients
             self.access_tokens = access_tokens
             self.refresh_tokens = refresh_tokens
             self.token_to_email = token_to_email
+            self._refresh_lineage = refresh_lineage
+            self._lineage_index = lineage_index
+            self._replay_cache = replay_cache
             _oauth_state_store.prune_expired(
-                self.access_tokens, self.refresh_tokens, self.token_to_email
+                self.access_tokens,
+                self.refresh_tokens,
+                self.token_to_email,
+                self._refresh_lineage,
+                self._lineage_index,
+                self._replay_cache,
             )
             _oauth_state_store.write_mcp_oauth_state_atomic(
                 self._oauth_state_path,
@@ -157,31 +222,44 @@ class GoogleOAuthProvider(OAuthProvider):
                     self.access_tokens,
                     self.refresh_tokens,
                     self.token_to_email,
+                    self._refresh_lineage,
+                    self._lineage_index,
+                    self._replay_cache,
                 ),
             )
             logger.info(
                 "Restored MCP OAuth state from disk: %d clients, %d access tokens, "
-                "%d refresh tokens",
+                "%d refresh tokens, %d families, %d replay entries",
                 len(self.clients),
                 len(self.access_tokens),
                 len(self.refresh_tokens),
+                len(self._lineage_index),
+                len(self._replay_cache),
             )
         except Exception as e:
             logger.warning("Could not load MCP OAuth state from disk: %s", e, exc_info=True)
 
     def _persist_oauth_state_sync(self) -> None:
-        """Write MCP OAuth state to disk (clients + tokens + email mapping)."""
+        """Write MCP OAuth state to disk (clients + tokens + lineage + replay)."""
         if not self._oauth_persist:
             return
         with self._oauth_state_lock:
             _oauth_state_store.prune_expired(
-                self.access_tokens, self.refresh_tokens, self.token_to_email
+                self.access_tokens,
+                self.refresh_tokens,
+                self.token_to_email,
+                self._refresh_lineage,
+                self._lineage_index,
+                self._replay_cache,
             )
             payload = _oauth_state_store.serialize_state(
                 self.clients,
                 self.access_tokens,
                 self.refresh_tokens,
                 self.token_to_email,
+                self._refresh_lineage,
+                self._lineage_index,
+                self._replay_cache,
             )
             _oauth_state_store.write_mcp_oauth_state_atomic(
                 self._oauth_state_path,
@@ -190,6 +268,63 @@ class GoogleOAuthProvider(OAuthProvider):
 
     async def _persist_oauth_state(self) -> None:
         await asyncio.to_thread(self._persist_oauth_state_sync)
+
+    # ------------------------------------------------------------------
+    # Family / lineage helpers
+    # ------------------------------------------------------------------
+
+    def _new_family_id(self) -> str:
+        return secrets.token_urlsafe(16)
+
+    def _family_lock(self, family_id: str) -> asyncio.Lock:
+        lock = self._family_locks.get(family_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._family_locks[family_id] = lock
+        return lock
+
+    def _register_family_member(
+        self,
+        family_id: str,
+        refresh_token: Optional[str] = None,
+        access_token: Optional[str] = None,
+    ) -> None:
+        entry = self._lineage_index.setdefault(
+            family_id, {"refresh_tokens": [], "access_tokens": []}
+        )
+        if refresh_token and refresh_token not in entry["refresh_tokens"]:
+            entry["refresh_tokens"].append(refresh_token)
+            self._refresh_lineage[refresh_token] = family_id
+        if access_token and access_token not in entry["access_tokens"]:
+            entry["access_tokens"].append(access_token)
+
+    def _purge_replay_entry(self, token: str) -> None:
+        self._replay_cache.pop(token, None)
+
+    def _prune_replay_cache(self, now: Optional[float] = None) -> None:
+        t = now if now is not None else time.time()
+        for tok, entry in list(self._replay_cache.items()):
+            if float(entry.get("replay_expires_at", 0)) < t:
+                self._replay_cache.pop(tok, None)
+
+    async def _revoke_family(self, family_id: str, reason: str) -> None:
+        """Revoke every token in a refresh-token family."""
+        idx = self._lineage_index.pop(family_id, None)
+        if not idx:
+            return
+        for at in idx.get("access_tokens", []):
+            self.access_tokens.pop(at, None)
+            self.token_to_email.pop(at, None)
+        for rt in idx.get("refresh_tokens", []):
+            self.refresh_tokens.pop(rt, None)
+            self.token_to_email.pop(rt, None)
+            self._refresh_lineage.pop(rt, None)
+            self._purge_replay_entry(rt)
+        self._family_locks.pop(family_id, None)
+        logger.warning(
+            "Revoked refresh-token family %s (%s)", family_id, reason
+        )
+        await self._persist_oauth_state()
 
     # ------------------------------------------------------------------
     # Client registration
@@ -473,8 +608,18 @@ class GoogleOAuthProvider(OAuthProvider):
         self.token_to_email[access_token_value] = user_email
         self.token_to_email[refresh_token_value] = user_email
 
+        family_id = self._new_family_id()
+        self._register_family_member(
+            family_id,
+            refresh_token=refresh_token_value,
+            access_token=access_token_value,
+        )
+
         logger.info(
-            "Issued MCP tokens for user=%s (client=%s)", user_email, client.client_id
+            "Issued MCP tokens for user=%s (client=%s, family=%s)",
+            user_email,
+            client.client_id,
+            family_id,
         )
 
         await self._persist_oauth_state()
@@ -489,23 +634,74 @@ class GoogleOAuthProvider(OAuthProvider):
         )
 
     # ------------------------------------------------------------------
-    # Refresh token exchange
+    # Refresh token exchange  (with rotation, grace window, reuse detection)
     # ------------------------------------------------------------------
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> Optional[RefreshToken]:
+        """
+        Validate a refresh token for the token endpoint.
+
+        * Live token              -> return it (will be rotated by exchange_refresh_token).
+        * Within replay grace     -> return a synthetic RefreshToken; the
+                                     successor tokens are served from the
+                                     replay cache by exchange_refresh_token.
+        * Past replay grace, but
+          known to have been
+          rotated previously      -> reuse detected; revoke the entire family
+                                     and return None (handler emits 400).
+        * Unknown                 -> return None.
+        """
+        now = time.time()
+        self._prune_replay_cache(now)
+
         rt = self.refresh_tokens.get(refresh_token)
-        if not rt:
+        if rt is not None:
+            if rt.client_id != client.client_id:
+                return None
+            if rt.expires_at is not None and rt.expires_at < now:
+                self.refresh_tokens.pop(refresh_token, None)
+                self.token_to_email.pop(refresh_token, None)
+                self._refresh_lineage.pop(refresh_token, None)
+                await self._persist_oauth_state()
+                return None
+            return rt
+
+        replay = self._replay_cache.get(refresh_token)
+        if replay is not None:
+            if replay.get("client_id") and replay["client_id"] != client.client_id:
+                return None
+            if float(replay.get("replay_expires_at", 0)) >= now:
+                return RefreshToken(
+                    token=refresh_token,
+                    client_id=client.client_id,
+                    scopes=list(replay.get("scopes") or []),
+                    expires_at=int(float(replay["replay_expires_at"])),
+                )
+            # Past grace window but we still remember the rotation -> reuse.
+            if self.reuse_detection_enabled:
+                family_id = replay.get("family") or self._refresh_lineage.get(
+                    refresh_token
+                )
+                if family_id:
+                    await self._revoke_family(
+                        family_id,
+                        reason="refresh token reused past grace window",
+                    )
             return None
-        if rt.client_id != client.client_id:
+
+        # No live entry, no replay entry, but lineage remembers this token —
+        # the legitimate client has already rotated it. Treat as reuse.
+        family_id = self._refresh_lineage.get(refresh_token)
+        if family_id and self.reuse_detection_enabled:
+            await self._revoke_family(
+                family_id,
+                reason="refresh token reused after rotation",
+            )
             return None
-        if rt.expires_at is not None and rt.expires_at < time.time():
-            self.refresh_tokens.pop(refresh_token, None)
-            self.token_to_email.pop(refresh_token, None)
-            await self._persist_oauth_state()
-            return None
-        return rt
+
+        return None
 
     async def exchange_refresh_token(
         self,
@@ -513,49 +709,157 @@ class GoogleOAuthProvider(OAuthProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        user_email = self.token_to_email.get(refresh_token.token)
+        token_value = refresh_token.token
 
-        if user_email:
-            self._try_refresh_google_token(user_email)
+        family_id = self._refresh_lineage.get(token_value)
+        if family_id is None:
+            replay_entry = self._replay_cache.get(token_value)
+            if replay_entry is not None:
+                family_id = replay_entry.get("family") or None
 
-        self.refresh_tokens.pop(refresh_token.token, None)
-        self.token_to_email.pop(refresh_token.token, None)
+        if family_id is None:
+            family_id = self._new_family_id()
+            self._register_family_member(family_id, refresh_token=token_value)
+            logger.info(
+                "Adopting legacy refresh token into new family %s", family_id
+            )
 
-        new_access = secrets.token_urlsafe(32)
-        new_refresh = secrets.token_urlsafe(32)
-        now = int(time.time())
-        expires_at = now + self.access_token_ttl
+        async with self._family_lock(family_id):
+            now = time.time()
+            self._prune_replay_cache(now)
 
-        self.access_tokens[new_access] = AccessToken(
-            token=new_access,
-            client_id=client.client_id,
-            scopes=scopes,
-            expires_at=expires_at,
-            claims={"email": user_email},
-        )
-        self.refresh_tokens[new_refresh] = RefreshToken(
-            token=new_refresh,
-            client_id=client.client_id,
-            scopes=scopes,
-            expires_at=now + self.refresh_token_ttl,
-        )
+            replay_entry = self._replay_cache.get(token_value)
+            if replay_entry is not None:
+                if float(replay_entry.get("replay_expires_at", 0)) >= now:
+                    new_access = replay_entry["new_access"]
+                    if new_access in self.access_tokens:
+                        remaining = max(
+                            1,
+                            int(self.access_tokens[new_access].expires_at - now)
+                            if self.access_tokens[new_access].expires_at
+                            else self.access_token_ttl,
+                        )
+                    else:
+                        remaining = self.access_token_ttl
+                    logger.info(
+                        "Replay-served rotated refresh for family %s (client=%s)",
+                        family_id,
+                        client.client_id,
+                    )
+                    return _OAuthTokenWithIdToken(
+                        access_token=new_access,
+                        token_type="Bearer",
+                        expires_in=remaining,
+                        refresh_token=replay_entry["new_refresh"],
+                        scope=" ".join(replay_entry.get("scopes") or scopes),
+                        id_token=replay_entry.get("id_token"),
+                    )
+                # past grace window → reuse detected
+                if self.reuse_detection_enabled:
+                    await self._revoke_family(
+                        family_id,
+                        reason="refresh token reused past grace window",
+                    )
+                    raise self._invalid_grant("refresh token has been rotated")
+                # if reuse detection disabled, drop stale replay entry
+                self._purge_replay_entry(token_value)
 
-        self.token_to_email[new_access] = user_email
-        self.token_to_email[new_refresh] = user_email
+            live = self.refresh_tokens.get(token_value)
+            if live is None:
+                # Not live, no replay entry, but lineage existed → token has
+                # been rotated and reused outside the grace window.
+                if self.reuse_detection_enabled and family_id in self._lineage_index:
+                    await self._revoke_family(
+                        family_id,
+                        reason="refresh token reused after rotation",
+                    )
+                raise self._invalid_grant("refresh token does not exist")
 
-        logger.info("Rotated MCP tokens for user=%s", user_email)
+            if live.client_id != client.client_id:
+                raise self._invalid_grant("refresh token does not exist")
+            if live.expires_at is not None and live.expires_at < now:
+                self.refresh_tokens.pop(token_value, None)
+                self.token_to_email.pop(token_value, None)
+                self._refresh_lineage.pop(token_value, None)
+                raise self._invalid_grant("refresh token has expired")
 
-        await self._persist_oauth_state()
+            user_email = self.token_to_email.get(token_value)
+            if user_email:
+                self._try_refresh_google_token(user_email)
 
-        google_id_token = self._user_id_tokens.get(user_email) if user_email else None
-        return _OAuthTokenWithIdToken(
-            access_token=new_access,
-            token_type="Bearer",
-            expires_in=self.access_token_ttl,
-            refresh_token=new_refresh,
-            scope=" ".join(scopes),
-            id_token=google_id_token,
-        )
+            new_access = secrets.token_urlsafe(32)
+            new_refresh = secrets.token_urlsafe(32)
+            now_i = int(now)
+            access_expires_at = now_i + self.access_token_ttl
+
+            self.access_tokens[new_access] = AccessToken(
+                token=new_access,
+                client_id=client.client_id,
+                scopes=scopes,
+                expires_at=access_expires_at,
+                claims={"email": user_email},
+            )
+            self.refresh_tokens[new_refresh] = RefreshToken(
+                token=new_refresh,
+                client_id=client.client_id,
+                scopes=scopes,
+                expires_at=now_i + self.refresh_token_ttl,
+            )
+
+            self.token_to_email[new_access] = user_email
+            self.token_to_email[new_refresh] = user_email
+
+            self._register_family_member(
+                family_id,
+                refresh_token=new_refresh,
+                access_token=new_access,
+            )
+
+            # Move the old refresh token into the replay cache and out of the
+            # live pool. Keep token_to_email and lineage so we can detect
+            # reuse even after the grace window.
+            self.refresh_tokens.pop(token_value, None)
+
+            google_id_token = (
+                self._user_id_tokens.get(user_email) if user_email else None
+            )
+
+            if self.refresh_grace_seconds > 0:
+                self._replay_cache[token_value] = {
+                    "new_access": new_access,
+                    "new_refresh": new_refresh,
+                    "expires_in": self.access_token_ttl,
+                    "scopes": list(scopes),
+                    "id_token": google_id_token,
+                    "rotated_at": now,
+                    "replay_expires_at": now + self.refresh_grace_seconds,
+                    "family": family_id,
+                    "client_id": client.client_id,
+                }
+
+            logger.info(
+                "Rotated MCP tokens for user=%s (family=%s, grace=%ss)",
+                user_email,
+                family_id,
+                self.refresh_grace_seconds,
+            )
+
+            await self._persist_oauth_state()
+
+            return _OAuthTokenWithIdToken(
+                access_token=new_access,
+                token_type="Bearer",
+                expires_in=self.access_token_ttl,
+                refresh_token=new_refresh,
+                scope=" ".join(scopes),
+                id_token=google_id_token,
+            )
+
+    @staticmethod
+    def _invalid_grant(description: str) -> Exception:
+        """Build a TokenError(invalid_grant=…) the way the MCP handler expects."""
+        from mcp.server.auth.provider import TokenError
+        return TokenError(error="invalid_grant", error_description=description)
 
     def _try_refresh_google_token(self, user_email: str) -> None:
         """Attempt to refresh the stored Google token for a user."""
@@ -599,6 +903,8 @@ class GoogleOAuthProvider(OAuthProvider):
         elif isinstance(token, RefreshToken):
             self.refresh_tokens.pop(token.token, None)
             self.token_to_email.pop(token.token, None)
+            self._purge_replay_entry(token.token)
+            self._refresh_lineage.pop(token.token, None)
         await self._persist_oauth_state()
 
     # ------------------------------------------------------------------
