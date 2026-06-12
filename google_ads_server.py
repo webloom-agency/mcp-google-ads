@@ -1571,13 +1571,8 @@ async def get_campaign_performance(
     NO DATA LOST: Aggregates include ALL campaigns, detailed view shows top N.
     Use format='table'/'json' for raw data (may be large).
     """
-    if days in (7, 14, 30, 60, 90, 180):
-        date_range = f"LAST_{days}_DAYS"
-    else:
-        date_range = "LAST_30_DAYS"
-
     # Build WHERE clause
-    where_clauses = [f"segments.date DURING {date_range}"]
+    where_clauses = [_gaql_date_filter(days)]
     if status_filter.upper() != "ALL":
         where_clauses.append(f"campaign.status = '{status_filter.upper()}'")
     where_str = " AND ".join(where_clauses)
@@ -1654,13 +1649,8 @@ async def get_ad_performance(
     NO DATA LOST: Aggregates include ALL ads, detailed view shows top N.
     Use format='table'/'json' for raw data (may be large).
     """
-    if days in (7, 14, 30, 60, 90, 180):
-        date_range = f"LAST_{days}_DAYS"
-    else:
-        date_range = "LAST_30_DAYS"
-
     # Build WHERE clause
-    where_clauses = [f"segments.date DURING {date_range}"]
+    where_clauses = [_gaql_date_filter(days)]
     if status_filter.upper() != "ALL":
         where_clauses.append(f"ad_group_ad.status = '{status_filter.upper()}'")
     if min_impressions > 0:
@@ -1743,13 +1733,8 @@ async def get_keyword_performance(
     Filters out keywords with <10 impressions by default.
     Use format='table'/'json' for raw data (may be large).
     """
-    if days in (7, 14, 30, 60, 90, 180):
-        date_range = f"LAST_{days}_DAYS"
-    else:
-        date_range = "LAST_30_DAYS"
-
     # Build WHERE clause
-    where_clauses = [f"segments.date DURING {date_range}"]
+    where_clauses = [_gaql_date_filter(days)]
     if status_filter.upper() != "ALL":
         where_clauses.append(f"ad_group_criterion.status = '{status_filter.upper()}'")
     if match_type:
@@ -1977,17 +1962,34 @@ def _match_campaign_filter(campaign_name: str, campaign_filter: str) -> bool:
     return False
 
 
+# Only these literals are valid with GAQL DURING (see Google Ads API date-ranges docs).
+_GAQL_DURING_DAYS = {7: "LAST_7_DAYS", 14: "LAST_14_DAYS", 30: "LAST_30_DAYS"}
+
+
+def _gaql_date_filter(days: int) -> str:
+    """
+    Return a GAQL segments.date condition.
+    LAST_60/90/180_DAYS are NOT valid — use BETWEEN for other day counts.
+    Ranges exclude today, consistent with LAST_N_DAYS semantics.
+    """
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 30
+    if days not in (7, 14, 30, 60, 90, 180):
+        days = 30
+    if days in _GAQL_DURING_DAYS:
+        return f"segments.date DURING {_GAQL_DURING_DAYS[days]}"
+    end_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    return f"segments.date BETWEEN '{start_date}' AND '{end_date}'"
+
 
 def _build_search_terms_query(days: int, order_by: str, status_filter: Optional[str],
                                min_impressions: int, min_cost: float) -> str:
     """Build the GAQL query for search terms."""
-    if days in (7, 14, 30, 60, 90, 180):
-        date_range = f"LAST_{days}_DAYS"
-    else:
-        date_range = "LAST_30_DAYS"
-
     where_clauses = [
-        f"segments.date DURING {date_range}",
+        _gaql_date_filter(days),
         "campaign.status = 'ENABLED'"
     ]
     if min_impressions > 0:
@@ -2030,13 +2032,8 @@ def _build_search_terms_query(days: int, order_by: str, status_filter: Optional[
 def _build_dsa_search_terms_query(days: int, order_by: str,
                                    min_impressions: int, min_cost: float) -> str:
     """Build the GAQL query for Dynamic Search Ads search terms."""
-    if days in (7, 14, 30, 60, 90, 180):
-        date_range = f"LAST_{days}_DAYS"
-    else:
-        date_range = "LAST_30_DAYS"
-
     where_clauses = [
-        f"segments.date DURING {date_range}",
+        _gaql_date_filter(days),
         "campaign.status = 'ENABLED'"
     ]
     if min_impressions > 0:
@@ -2077,13 +2074,8 @@ def _build_dsa_search_terms_query(days: int, order_by: str,
 def _build_pmax_search_terms_query(days: int, order_by: str,
                                     min_impressions: int, min_cost: float) -> str:
     """Build the GAQL query for Performance Max search terms (individual terms via campaign_search_term_view)."""
-    if days in (7, 14, 30, 60, 90, 180):
-        date_range = f"LAST_{days}_DAYS"
-    else:
-        date_range = "LAST_30_DAYS"
-
     where_clauses = [
-        f"segments.date DURING {date_range}",
+        _gaql_date_filter(days),
         "campaign.status = 'ENABLED'",
         "campaign.advertising_channel_type = 'PERFORMANCE_MAX'"
     ]
@@ -3063,10 +3055,7 @@ async def analyze_image_assets(
     days: CoercedInt = Field(default=30, description="Number of days to look back (7, 14, 30, 60, 90, 180)"),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
-    if days in (7, 14, 30, 60, 90, 180):
-        date_range = f"LAST_{days}_DAYS"
-    else:
-        date_range = "LAST_30_DAYS"
+    date_filter = _gaql_date_filter(days)
 
     query = f"""
         SELECT
@@ -3082,7 +3071,7 @@ async def analyze_image_assets(
             metrics.cost_micros
         FROM campaign_asset
         WHERE asset.type = 'IMAGE'
-          AND segments.date DURING {date_range}
+          AND {date_filter}
         ORDER BY metrics.impressions DESC
     """
     try:
@@ -3155,7 +3144,7 @@ def gaql_reference() -> str:
     # Google Ads Query Language (GAQL) Reference (short)
     SELECT field1, field2 FROM resource WHERE condition ORDER BY field LIMIT n
     Common resources: campaign, ad_group, ad_group_ad, asset, customer, keyword_view, customer_client, etc.
-    Date ranges: LAST_7_DAYS, LAST_14_DAYS, LAST_30_DAYS, LAST_90_DAYS, ...
+    Date ranges: LAST_7_DAYS, LAST_14_DAYS, LAST_30_DAYS (DURING); 60/90/180 use BETWEEN automatically.
     """
 
 @mcp.prompt("google_ads_workflow")
