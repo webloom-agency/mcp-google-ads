@@ -1937,10 +1937,11 @@ async def get_campaign_budgets(
 def _search_terms_cache_key(cid: str, days: int, order_by: str, status_filter: Optional[str],
                              min_impressions: int, min_cost: float,
                              include_dsa: bool = True, include_pmax: bool = True,
-                             campaign_filter: Optional[str] = None) -> str:
+                             campaign_filter: Optional[str] = None,
+                             include_conversion_actions: bool = False) -> str:
     """Build a deterministic cache key for search terms queries."""
     cf = campaign_filter.strip().lower() if campaign_filter else "ALL"
-    return f"{cid}|{days}|{order_by}|{status_filter or 'ALL'}|mi{min_impressions}|mc{min_cost}|dsa{include_dsa}|pmax{include_pmax}|cf{cf}"
+    return f"{cid}|{days}|{order_by}|{status_filter or 'ALL'}|mi{min_impressions}|mc{min_cost}|dsa{include_dsa}|pmax{include_pmax}|cf{cf}|ca{include_conversion_actions}"
 
 
 def _match_campaign_filter(campaign_name: str, campaign_filter: str) -> bool:
@@ -2109,6 +2110,104 @@ def _build_pmax_search_terms_query(days: int, order_by: str,
         WHERE {" AND ".join(where_clauses)}
         ORDER BY {order_clause}
     """
+
+
+def _build_conv_action_query(source: str, days: int) -> str:
+    """Build a GAQL query that splits conversions by conversion action name for one source.
+
+    IMPORTANT: When a conversion-action segment is present, only conversion metrics are
+    meaningful — cost/impressions/clicks are NOT split per action (they get repeated and
+    must not be summed). So we select metrics.conversions only and apply no cost/impression
+    filters here; the per-action counts are merged back onto the main rows by search term.
+    metrics.conversions already counts only PRIMARY ("principales") conversion actions, so
+    this naturally yields the main conversions broken out per action.
+    """
+    date_filter = _gaql_date_filter(days)
+    if source == "DSA":
+        return f"""
+            SELECT
+                campaign.name,
+                ad_group.name,
+                dynamic_search_ads_search_term_view.search_term,
+                segments.conversion_action_name,
+                metrics.conversions
+            FROM dynamic_search_ads_search_term_view
+            WHERE {date_filter} AND campaign.status = 'ENABLED' AND metrics.conversions > 0
+        """
+    if source == "PMAX":
+        return f"""
+            SELECT
+                campaign.name,
+                campaign_search_term_view.search_term,
+                segments.conversion_action_name,
+                metrics.conversions
+            FROM campaign_search_term_view
+            WHERE {date_filter} AND campaign.status = 'ENABLED' AND campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND metrics.conversions > 0
+        """
+    # SEARCH + SHOPPING both live in search_term_view
+    return f"""
+        SELECT
+            campaign.name,
+            ad_group.name,
+            search_term_view.search_term,
+            segments.conversion_action_name,
+            metrics.conversions
+        FROM search_term_view
+        WHERE {date_filter} AND campaign.status = 'ENABLED' AND metrics.conversions > 0
+    """
+
+
+def _conv_action_key(search_term: str, campaign_name: str, ad_group_name: str) -> tuple:
+    """Stable join key between segmented conversion-action rows and main search-term rows."""
+    return (
+        (search_term or "").strip().lower(),
+        (campaign_name or "").strip().lower(),
+        (ad_group_name or "").strip().lower(),
+    )
+
+
+# Maps each source's segmented-query response to the camelCase view key holding the search term.
+_CONV_ACTION_TERM_FIELD = {
+    "STD": "searchTermView",
+    "DSA": "dynamicSearchAdsSearchTermView",
+    "PMAX": "campaignSearchTermView",
+}
+
+
+def _fetch_conversions_by_action(cid: str, headers: Dict[str, str], days: int,
+                                  include_dsa: bool, include_pmax: bool) -> Dict[tuple, Dict[str, float]]:
+    """Fetch per-conversion-action breakdowns and merge them into a join-keyed map.
+
+    Returns: {(search_term, campaign, ad_group): {action_name: conversions}}.
+    Each source is fetched independently and failures are skipped gracefully — some
+    views (notably PMAX/DSA) may not support conversion-action segmentation.
+    """
+    sources = [("STD", _build_conv_action_query("SEARCH", days))]
+    if include_dsa:
+        sources.append(("DSA", _build_conv_action_query("DSA", days)))
+    if include_pmax:
+        sources.append(("PMAX", _build_conv_action_query("PMAX", days)))
+
+    out: Dict[tuple, Dict[str, float]] = {}
+    for src, query in sources:
+        try:
+            rows = _gaql_search_all(cid, query, headers)
+        except Exception as e:
+            logger.warning(f"⚠ Conversion-action segmentation unavailable for {src} (skipping): {e}")
+            continue
+        term_field = _CONV_ACTION_TERM_FIELD[src]
+        for r in rows:
+            term = r.get(term_field, {}).get("searchTerm", "")
+            campaign_name = r.get("campaign", {}).get("name", "")
+            ad_group_name = r.get("adGroup", {}).get("name", "")
+            action = r.get("segments", {}).get("conversionActionName", "")
+            conv = float(r.get("metrics", {}).get("conversions", 0) or 0)
+            if not action or conv <= 0:
+                continue
+            key = _conv_action_key(term, campaign_name, ad_group_name)
+            bucket = out.setdefault(key, {})
+            bucket[action] = bucket.get(action, 0.0) + conv
+    return out
 
 
 def _normalize_dsa_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -2280,6 +2379,10 @@ def _format_search_term_json(row: Dict[str, Any]) -> Dict[str, Any]:
         "cpa": round(((cost / 1_000_000) / conv) if conv > 0 else 0, 2),
         "roas": round((conv_value / (cost / 1_000_000)) if cost > 0 else 0, 2),
     }
+    # Per-action primary conversions (only present when include_conversion_actions=True)
+    cba = row.get("_conversions_by_action")
+    if cba is not None:
+        result["conversions_by_action"] = cba
     # Add DSA-specific fields
     if source == "DSA":
         result["dsa_headline"] = row.get("_dsaHeadline", "")
@@ -2311,7 +2414,8 @@ async def get_search_terms(
     campaign_filter: Optional[str] = Field(default=None, description="Filter by campaign name. Supports: single name ('Shopping FR'), multiple names comma-separated ('Shopping FR,Shopping EN'), or substring match with * wildcard ('*shopping*' matches any campaign containing 'shopping'). Case-insensitive."),
     include_dsa: CoercedBool = Field(default=True, description="Include Dynamic Search Ads search terms (from dynamic_search_ads_search_term_view)"),
     include_pmax: CoercedBool = Field(default=True, description="Include Performance Max search terms (individual terms from campaign_search_term_view, with full metrics including cost)"),
-    fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include per row (e.g. 'search_term,source,campaign,impressions,clicks,conversions,cpa,cost'). None = all fields. Available: search_term, source, status, match_type, campaign, channel_type, ad_group, impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value, conv_rate, cpa, roas"),
+    fields: Optional[str] = Field(default=None, description="Comma-separated list of fields to include per row (e.g. 'search_term,source,campaign,impressions,clicks,conversions,cpa,cost'). None = all fields. Available: search_term, source, status, match_type, campaign, channel_type, ad_group, impressions, clicks, ctr, avg_cpc, cost, conversions, conversions_value, conv_rate, cpa, roas, conversions_by_action"),
+    include_conversion_actions: CoercedBool = Field(default=False, description="Break out PRIMARY ('principales') conversions per conversion action (e.g. Phone, Form). Adds a 'conversions_by_action' dict {action_name: conversions} to each row. Works for SEARCH/SHOPPING (and DSA/PMAX where the API supports conversion-action segmentation). Default False (retrocompatible)."),
     include_summary: CoercedBool = Field(default=True, description="Include summary/aggregates in JSON output. Set false for minimal output."),
     login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
 ) -> str:
@@ -2325,6 +2429,9 @@ async def get_search_terms(
     
     Each row includes a 'source' field: 'SEARCH', 'DSA', or 'PMAX'.
     All sources return individual search terms with full metrics (including cost).
+
+    Set include_conversion_actions=True to also break out PRIMARY conversions per
+    conversion action (e.g. {"Appels": 3, "Formulaire": 1}) under 'conversions_by_action'.
     
     Results are cached for 10 minutes so repeated calls are instant.
     
@@ -2342,7 +2449,8 @@ async def get_search_terms(
 
     cache_key = _search_terms_cache_key(cid, days, order_by, status_filter, min_impressions, min_cost,
                                          include_dsa=include_dsa, include_pmax=include_pmax,
-                                         campaign_filter=campaign_filter)
+                                         campaign_filter=campaign_filter,
+                                         include_conversion_actions=include_conversion_actions)
 
     # --- Check cache ---
     st_cache = _get_search_terms_cache()
@@ -2411,6 +2519,26 @@ async def get_search_terms(
                 if not rows:
                     return f"No search terms found matching campaign filter '{campaign_filter}'."
                 logger.info(f"🔍 Campaign filter '{campaign_filter}' → {len(rows)} rows remaining")
+
+            # Optional: break out primary conversions per conversion action
+            if include_conversion_actions:
+                try:
+                    logger.info(f"🔍 Fetching conversion-action breakdown for {cid}...")
+                    cba_map = _fetch_conversions_by_action(cid, headers, days, include_dsa, include_pmax)
+                    attached = 0
+                    for r in rows:
+                        key = _conv_action_key(
+                            r.get("searchTermView", {}).get("searchTerm", ""),
+                            r.get("campaign", {}).get("name", ""),
+                            r.get("adGroup", {}).get("name", ""),
+                        )
+                        actions = cba_map.get(key)
+                        if actions:
+                            r["_conversions_by_action"] = {a: round(v, 2) for a, v in actions.items()}
+                            attached += 1
+                    logger.info(f"   ✓ conversion-action breakdown attached to {attached}/{len(rows)} rows")
+                except Exception as e:
+                    logger.warning(f"⚠ Conversion-action breakdown failed (skipping): {e}")
 
             summary = _compute_search_terms_summary(rows)
 
