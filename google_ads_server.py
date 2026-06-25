@@ -2144,12 +2144,16 @@ def _build_conv_action_query(source: str, days: int) -> str:
             FROM campaign_search_term_view
             WHERE {date_filter} AND campaign.status = 'ENABLED' AND campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND metrics.conversions > 0
         """
-    # SEARCH + SHOPPING both live in search_term_view
+    # SEARCH + SHOPPING both live in search_term_view.
+    # The main search_term_view query is segmented by segments.keyword.info.match_type
+    # (one row per match type), so we MUST segment by it here too — otherwise a term-level
+    # action total would be attached to each match-type slice and overcount.
     return f"""
         SELECT
             campaign.name,
             ad_group.name,
             search_term_view.search_term,
+            segments.keyword.info.match_type,
             segments.conversion_action_name,
             metrics.conversions
         FROM search_term_view
@@ -2157,12 +2161,23 @@ def _build_conv_action_query(source: str, days: int) -> str:
     """
 
 
-def _conv_action_key(search_term: str, campaign_name: str, ad_group_name: str) -> tuple:
-    """Stable join key between segmented conversion-action rows and main search-term rows."""
+def _row_match_type(row: Dict[str, Any]) -> str:
+    """Extract the keyword match type segment from a raw row (empty for DSA/PMAX)."""
+    return row.get("segments", {}).get("keyword", {}).get("info", {}).get("matchType", "") or ""
+
+
+def _conv_action_key(search_term: str, campaign_name: str, ad_group_name: str,
+                     match_type: str = "") -> tuple:
+    """Stable join key between segmented conversion-action rows and main search-term rows.
+
+    Must mirror EXACTLY the granularity of the main query (which segments search_term_view
+    by match type) so that sum(conversions_by_action) == row conversions per row.
+    """
     return (
         (search_term or "").strip().lower(),
         (campaign_name or "").strip().lower(),
         (ad_group_name or "").strip().lower(),
+        (match_type or "").strip().upper(),
     )
 
 
@@ -2204,7 +2219,7 @@ def _fetch_conversions_by_action(cid: str, headers: Dict[str, str], days: int,
             conv = float(r.get("metrics", {}).get("conversions", 0) or 0)
             if not action or conv <= 0:
                 continue
-            key = _conv_action_key(term, campaign_name, ad_group_name)
+            key = _conv_action_key(term, campaign_name, ad_group_name, _row_match_type(r))
             bucket = out.setdefault(key, {})
             bucket[action] = bucket.get(action, 0.0) + conv
     return out
@@ -2531,10 +2546,21 @@ async def get_search_terms(
                             r.get("searchTermView", {}).get("searchTerm", ""),
                             r.get("campaign", {}).get("name", ""),
                             r.get("adGroup", {}).get("name", ""),
+                            _row_match_type(r),
                         )
                         actions = cba_map.get(key)
                         if actions:
-                            r["_conversions_by_action"] = {a: round(v, 2) for a, v in actions.items()}
+                            # Coherence guard: per-action primary conversions can never exceed
+                            # the row's own primary-conversions total (same granularity now).
+                            row_total = float(r.get("metrics", {}).get("conversions", 0) or 0)
+                            cba = {a: round(v, 2) for a, v in actions.items()}
+                            action_sum = sum(cba.values())
+                            if row_total > 0 and action_sum > row_total + 0.01:
+                                logger.warning(
+                                    f"⚠ conv-action sum ({action_sum}) > row conversions "
+                                    f"({row_total}) for '{key[0]}' — check segmentation granularity"
+                                )
+                            r["_conversions_by_action"] = cba
                             attached += 1
                     logger.info(f"   ✓ conversion-action breakdown attached to {attached}/{len(rows)} rows")
                 except Exception as e:
