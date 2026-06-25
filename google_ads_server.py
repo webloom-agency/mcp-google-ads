@@ -2030,6 +2030,57 @@ def _build_search_terms_query(days: int, order_by: str, status_filter: Optional[
     """
 
 
+def _build_shopping_search_terms_query(days: int, order_by: str, status_filter: Optional[str],
+                                        min_impressions: int, min_cost: float) -> str:
+    """Build the GAQL query for SHOPPING search terms.
+
+    Shopping must be fetched separately from the standard query because that query
+    selects segments.keyword.info.match_type — and per the Google Ads API, including any
+    segments.keyword.* field restricts results to Search-keyword rows, silently excluding
+    Shopping (which uses product groups, not keywords). So here we drop the keyword segment
+    and filter to the Shopping channel.
+    """
+    where_clauses = [
+        _gaql_date_filter(days),
+        "campaign.status = 'ENABLED'",
+        "campaign.advertising_channel_type = 'SHOPPING'",
+    ]
+    if min_impressions > 0:
+        where_clauses.append(f"metrics.impressions >= {min_impressions}")
+    if min_cost > 0:
+        min_cost_micros = int(min_cost * 1_000_000)
+        where_clauses.append(f"metrics.cost_micros >= {min_cost_micros}")
+    if status_filter:
+        where_clauses.append(f"search_term_view.status = '{status_filter.upper()}'")
+
+    order_map = {
+        "cost": "metrics.cost_micros DESC",
+        "clicks": "metrics.clicks DESC",
+        "conversions": "metrics.conversions DESC",
+        "impressions": "metrics.impressions DESC",
+    }
+    order_clause = order_map.get(order_by.lower(), "metrics.cost_micros DESC")
+
+    return f"""
+        SELECT
+            campaign.name,
+            campaign.advertising_channel_type,
+            ad_group.name,
+            search_term_view.search_term,
+            search_term_view.status,
+            metrics.clicks,
+            metrics.impressions,
+            metrics.ctr,
+            metrics.average_cpc,
+            metrics.cost_micros,
+            metrics.conversions,
+            metrics.conversions_value
+        FROM search_term_view
+        WHERE {" AND ".join(where_clauses)}
+        ORDER BY {order_clause}
+    """
+
+
 def _build_dsa_search_terms_query(days: int, order_by: str,
                                    min_impressions: int, min_cost: float) -> str:
     """Build the GAQL query for Dynamic Search Ads search terms."""
@@ -2144,10 +2195,23 @@ def _build_conv_action_query(source: str, days: int) -> str:
             FROM campaign_search_term_view
             WHERE {date_filter} AND campaign.status = 'ENABLED' AND campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND metrics.conversions > 0
         """
-    # SEARCH + SHOPPING both live in search_term_view.
-    # The main search_term_view query is segmented by segments.keyword.info.match_type
+    if source == "SHOPPING":
+        # Shopping has no keywords — mirror the dedicated Shopping main query (no keyword
+        # segment, channel-filtered), so the join granularity matches (no match_type).
+        return f"""
+            SELECT
+                campaign.name,
+                ad_group.name,
+                search_term_view.search_term,
+                segments.conversion_action_name,
+                metrics.conversions
+            FROM search_term_view
+            WHERE {date_filter} AND campaign.status = 'ENABLED' AND campaign.advertising_channel_type = 'SHOPPING' AND metrics.conversions > 0
+        """
+    # SEARCH (keyword rows). The main Search query is segmented by segments.keyword.info.match_type
     # (one row per match type), so we MUST segment by it here too — otherwise a term-level
-    # action total would be attached to each match-type slice and overcount.
+    # action total would be attached to each match-type slice and overcount. The keyword
+    # segment also restricts this to Search-keyword rows (Shopping handled separately above).
     return f"""
         SELECT
             campaign.name,
@@ -2184,6 +2248,7 @@ def _conv_action_key(search_term: str, campaign_name: str, ad_group_name: str,
 # Maps each source's segmented-query response to the camelCase view key holding the search term.
 _CONV_ACTION_TERM_FIELD = {
     "STD": "searchTermView",
+    "SHOPPING": "searchTermView",
     "DSA": "dynamicSearchAdsSearchTermView",
     "PMAX": "campaignSearchTermView",
 }
@@ -2197,7 +2262,10 @@ def _fetch_conversions_by_action(cid: str, headers: Dict[str, str], days: int,
     Each source is fetched independently and failures are skipped gracefully — some
     views (notably PMAX/DSA) may not support conversion-action segmentation.
     """
-    sources = [("STD", _build_conv_action_query("SEARCH", days))]
+    sources = [
+        ("STD", _build_conv_action_query("SEARCH", days)),
+        ("SHOPPING", _build_conv_action_query("SHOPPING", days)),
+    ]
     if include_dsa:
         sources.append(("DSA", _build_conv_action_query("DSA", days)))
     if include_pmax:
@@ -2437,10 +2505,12 @@ async def get_search_terms(
     """
     Get search terms report — returns ALL matching rows in a single response.
     
-    Fetches search terms from up to 3 sources:
-      1. search_term_view — Standard Search & Shopping campaigns (always included)
-      2. dynamic_search_ads_search_term_view — DSA campaigns (include_dsa=True)
-      3. campaign_search_term_view — Performance Max campaigns (include_pmax=True)
+    Fetches search terms from up to 4 sources:
+      1. search_term_view (Search keywords) — standard Search campaigns (always included)
+      2. search_term_view (Shopping) — Shopping campaigns, fetched separately because the
+         keyword segment in #1 excludes them (always included)
+      3. dynamic_search_ads_search_term_view — DSA campaigns (include_dsa=True)
+      4. campaign_search_term_view — Performance Max campaigns (include_pmax=True)
     
     Each row includes a 'source' field: 'SEARCH', 'DSA', or 'PMAX'.
     All sources return individual search terms with full metrics (including cost).
@@ -2480,7 +2550,8 @@ async def get_search_terms(
             creds = get_credentials(_get_user_email())
             headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
 
-            # 1) Standard search_term_view (Search + Shopping)
+            # 1) Standard search_term_view — Search-keyword rows ONLY.
+            #    (The keyword match_type segment in this query excludes Shopping/DSA/PMAX.)
             query = _build_search_terms_query(days, order_by, status_filter, min_impressions, min_cost)
             logger.info(f"🔍 Fetching search terms for {cid} (days={days}, min_cost={min_cost})...")
             rows = _gaql_search_all(cid, query, headers)
@@ -2488,8 +2559,21 @@ async def get_search_terms(
             for r in rows:
                 ch = r.get("campaign", {}).get("advertisingChannelType", "")
                 r["_source"] = "SHOPPING" if ch == "SHOPPING" else "SEARCH"
+            logger.info(f"   ✓ {len(rows)} Search search terms found")
 
-            # 2) DSA search terms
+            # 2) Shopping search terms (separate query — keyword segment would exclude them)
+            try:
+                shopping_query = _build_shopping_search_terms_query(days, order_by, status_filter, min_impressions, min_cost)
+                logger.info(f"🔍 Fetching Shopping search terms for {cid}...")
+                shopping_rows = _gaql_search_all(cid, shopping_query, headers)
+                for r in shopping_rows:
+                    r["_source"] = "SHOPPING"
+                rows.extend(shopping_rows)
+                logger.info(f"   ✓ {len(shopping_rows)} Shopping search terms found")
+            except Exception as e:
+                logger.warning(f"⚠ Shopping search terms query failed (skipping): {e}")
+
+            # 3) DSA search terms
             if include_dsa:
                 try:
                     dsa_query = _build_dsa_search_terms_query(days, order_by, min_impressions, min_cost)
@@ -2501,7 +2585,7 @@ async def get_search_terms(
                 except Exception as e:
                     logger.warning(f"⚠ DSA search terms query failed (skipping): {e}")
 
-            # 3) PMAX search terms (individual terms via campaign_search_term_view)
+            # 4) PMAX search terms (individual terms via campaign_search_term_view)
             if include_pmax:
                 try:
                     pmax_query = _build_pmax_search_terms_query(days, order_by, min_impressions, min_cost)
