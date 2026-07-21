@@ -303,6 +303,7 @@ def _is_readonly_allowed(url: str, method: str) -> bool:
     Whitelist Google Ads API endpoints that are considered read-only.
     Currently allowed:
       - POST .../customers/{cid}/googleAds:search (GAQL search)
+      - POST .../customers/{cid}:generateKeywordHistoricalMetrics (Keyword Planner volumes)
       - GET  .../customers:listAccessibleCustomers
     """
     if not _is_google_ads_api_url(url):
@@ -314,6 +315,8 @@ def _is_readonly_allowed(url: str, method: str) -> bool:
         path = str(url)
 
     if method_u == "POST" and path.endswith("/googleAds:search"):
+        return True
+    if method_u == "POST" and path.endswith(":generateKeywordHistoricalMetrics"):
         return True
     if method_u == "GET" and path.endswith("/customers:listAccessibleCustomers"):
         return True
@@ -1802,6 +1805,189 @@ async def get_keyword_performance(
         fields=None,
         login_customer_id=login_customer_id
     )
+
+
+def _parse_csv_list(value: Optional[str]) -> List[str]:
+    """Split a comma/newline-separated string into stripped non-empty items."""
+    if not value:
+        return []
+    parts: List[str] = []
+    for chunk in re.split(r"[\n,]+", str(value)):
+        item = chunk.strip()
+        if item:
+            parts.append(item)
+    return parts
+
+
+def _geo_target_resource_names(geo_target_ids: Optional[str]) -> List[str]:
+    """Convert criterion IDs (e.g. '2840,2250') or resource names to geoTargetConstants/..."""
+    names: List[str] = []
+    for item in _parse_csv_list(geo_target_ids):
+        if item.startswith("geoTargetConstants/"):
+            names.append(item)
+        else:
+            digits = re.sub(r"\D", "", item)
+            if not digits:
+                raise ValueError(f"Invalid geo target ID: {item!r}")
+            names.append(f"geoTargetConstants/{digits}")
+    return names
+
+
+def _language_resource_name(language_id: Optional[str]) -> Optional[str]:
+    """Convert language criterion ID (e.g. '1000') or resource name to languageConstants/..."""
+    if language_id is None or str(language_id).strip() == "":
+        return None
+    item = str(language_id).strip()
+    if item.startswith("languageConstants/"):
+        return item
+    digits = re.sub(r"\D", "", item)
+    if not digits:
+        raise ValueError(f"Invalid language ID: {language_id!r}")
+    return f"languageConstants/{digits}"
+
+
+def _micros_to_currency(micros: Any) -> Optional[float]:
+    if micros is None or micros == "":
+        return None
+    try:
+        return int(micros) / 1_000_000
+    except (TypeError, ValueError):
+        return None
+
+
+@mcp.tool()
+async def get_keyword_search_volumes(
+    customer_id: str = Field(description="Google Ads customer ID (10 digits) or account name — used for API access / billing"),
+    keywords: str = Field(description="Comma- or newline-separated keywords/search terms to look up (max 10,000)"),
+    geo_target_ids: Optional[str] = Field(
+        default="2840",
+        description="Comma-separated geo criterion IDs (e.g. '2840' = US, '2250' = France, '2826' = UK). Empty = all geos. Max 10."
+    ),
+    language_id: Optional[str] = Field(
+        default="1000",
+        description="Language criterion ID (e.g. '1000' = English, '1002' = French). Empty = all languages."
+    ),
+    network: str = Field(
+        default="GOOGLE_SEARCH",
+        description="Keyword plan network: 'GOOGLE_SEARCH' or 'GOOGLE_SEARCH_AND_PARTNERS'"
+    ),
+    include_monthly: CoercedBool = Field(
+        default=False,
+        description="Include per-month search volume breakdown for the past 12 months"
+    ),
+    include_average_cpc: CoercedBool = Field(
+        default=False,
+        description="Include average CPC estimates in the response"
+    ),
+    format: str = Field(default="json", description="'json' (default) or 'table'"),
+    login_customer_id: Optional[str] = Field(default=None, description="Optional MCC ID override")
+) -> str:
+    """
+    Get Keyword Planner historical search volumes for keywords/search terms.
+
+    Uses KeywordPlanIdeaService.GenerateKeywordHistoricalMetrics (same data as Keyword Planner).
+    Returns avg monthly searches, competition, competition index, and top-of-page bid ranges.
+    Near-exact duplicates may be collapsed (e.g. 'car' and 'cars' → one result).
+    """
+    try:
+        keyword_list = _parse_csv_list(keywords)
+        if not keyword_list:
+            return "Error: at least one keyword is required."
+        if len(keyword_list) > 10_000:
+            return f"Error: max 10,000 keywords; got {len(keyword_list)}."
+
+        network_u = (network or "GOOGLE_SEARCH").strip().upper()
+        if network_u not in ("GOOGLE_SEARCH", "GOOGLE_SEARCH_AND_PARTNERS"):
+            return "Error: network must be 'GOOGLE_SEARCH' or 'GOOGLE_SEARCH_AND_PARTNERS'."
+
+        geo_names = _geo_target_resource_names(geo_target_ids)
+        if len(geo_names) > 10:
+            return "Error: max 10 geo targets."
+        language_name = _language_resource_name(language_id)
+
+        creds = get_credentials(_get_user_email())
+        cid = coerce_customer_id(customer_id, prefer_non_manager=True)
+        headers = get_headers(creds, login_customer_id=login_customer_id or _resolve_login_customer_id(cid))
+
+        url = f"https://googleads.googleapis.com/{API_VERSION}/customers/{cid}:generateKeywordHistoricalMetrics"
+        payload: Dict[str, Any] = {
+            "keywords": keyword_list,
+            "keywordPlanNetwork": network_u,
+        }
+        if geo_names:
+            payload["geoTargetConstants"] = geo_names
+        if language_name:
+            payload["language"] = language_name
+        if include_average_cpc:
+            payload["historicalMetricsOptions"] = {"includeAverageCpc": True}
+
+        r = _google_ads_request("POST", url, headers, json=payload)
+        if r.status_code != 200:
+            return f"Error getting keyword search volumes (HTTP {r.status_code}): {r.text}"
+
+        data = r.json()
+        results = data.get("results") or []
+        if not results:
+            return "No historical metrics returned for the given keywords."
+
+        rows: List[Dict[str, Any]] = []
+        for result in results:
+            metrics = result.get("keywordMetrics") or {}
+            row: Dict[str, Any] = {
+                "keyword": result.get("text", ""),
+                "close_variants": result.get("closeVariants") or [],
+                "avg_monthly_searches": int(metrics["avgMonthlySearches"]) if metrics.get("avgMonthlySearches") not in (None, "") else None,
+                "competition": metrics.get("competition"),
+                "competition_index": int(metrics["competitionIndex"]) if metrics.get("competitionIndex") not in (None, "") else None,
+                "low_top_of_page_bid": _micros_to_currency(metrics.get("lowTopOfPageBidMicros")),
+                "high_top_of_page_bid": _micros_to_currency(metrics.get("highTopOfPageBidMicros")),
+            }
+            if include_average_cpc:
+                row["average_cpc"] = _micros_to_currency(metrics.get("averageCpcMicros"))
+            if include_monthly:
+                monthly = []
+                for m in metrics.get("monthlySearchVolumes") or []:
+                    monthly.append({
+                        "year": int(m["year"]) if m.get("year") not in (None, "") else None,
+                        "month": m.get("month"),
+                        "searches": int(m["monthlySearches"]) if m.get("monthlySearches") not in (None, "") else None,
+                    })
+                row["monthly_search_volumes"] = monthly
+            rows.append(row)
+
+        if format.lower() == "json":
+            return json.dumps({
+                "customer_id": cid,
+                "geo_target_ids": geo_names,
+                "language": language_name,
+                "network": network_u,
+                "requested_keywords": len(keyword_list),
+                "results": rows,
+            }, indent=2)
+
+        # table format
+        lines = [
+            f"Keyword search volumes for customer {cid}",
+            f"Network: {network_u} | Geos: {', '.join(geo_names) or 'ALL'} | Language: {language_name or 'ALL'}",
+            f"Requested: {len(keyword_list)} | Returned: {len(rows)}",
+            "",
+            f"{'Keyword':<40} {'Avg/mo':>10} {'Comp':<12} {'Idx':>5} {'Low bid':>10} {'High bid':>10}",
+            "-" * 92,
+        ]
+        for row in rows:
+            avg = "" if row["avg_monthly_searches"] is None else f"{row['avg_monthly_searches']:,}"
+            idx = "" if row["competition_index"] is None else str(row["competition_index"])
+            low = "" if row["low_top_of_page_bid"] is None else f"{row['low_top_of_page_bid']:.2f}"
+            high = "" if row["high_top_of_page_bid"] is None else f"{row['high_top_of_page_bid']:.2f}"
+            lines.append(
+                f"{(row['keyword'] or '')[:40]:<40} {avg:>10} {(row.get('competition') or ''):<12} {idx:>5} {low:>10} {high:>10}"
+            )
+            if row.get("close_variants"):
+                lines.append(f"  variants: {', '.join(row['close_variants'])}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting keyword search volumes: {str(e)}"
+
 
 @mcp.tool()
 async def get_campaign_budgets(
