@@ -1,16 +1,18 @@
 """
 Persist FastMCP / MCP OAuth authorization-server state to disk.
 
-Survives process restarts (e.g. Render deploys) so registered clients and
-MCP access/refresh tokens remain valid while Google user credentials are
-stored separately by the credential store.
+Survives process restarts and coordinates multiple workers via an exclusive
+file lock + merge-before-write so one process cannot wipe another's in-flight
+login or freshly registered DCR clients.
 
 Schema:
     v1: clients + access_tokens + refresh_tokens + token_to_email
-    v2: v1  + refresh_lineage  + lineage_index + replay_cache
-        (refresh-token-rotation grace window and reuse detection)
+    v2: v1 + refresh_lineage + lineage_index + replay_cache
+    v2 (extended): also pending_authorizations, auth_codes, email/id maps,
+        tombstones (backward compatible — old readers ignore unknown keys;
+        this writer always emits v2 with the extended fields)
 
-The reader accepts both v1 and v2 payloads; the writer always emits v2.
+The reader accepts v1 and v2 payloads; the writer always emits v2.
 """
 
 from __future__ import annotations
@@ -20,9 +22,10 @@ import logging
 import os
 import tempfile
 import time
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
-from mcp.server.auth.provider import RefreshToken
+from mcp.server.auth.provider import AuthorizationCode, RefreshToken
 from mcp.shared.auth import OAuthClientInformationFull
 
 from fastmcp.server.auth.auth import AccessToken
@@ -33,14 +36,51 @@ STATE_VERSION = 2
 SUPPORTED_VERSIONS = (1, 2)
 SUBDIR_NAME = "mcp_oauth"
 STATE_FILENAME = "server_state.json"
+LOCK_FILENAME = "server_state.lock"
+
+DEFAULT_PENDING_TTL_SECONDS = 15 * 60
+DEFAULT_TOMBSTONE_TTL_SECONDS = 15 * 60
 
 
 def mcp_oauth_state_path(base_dir: str) -> str:
     return os.path.join(base_dir, SUBDIR_NAME, STATE_FILENAME)
 
 
+def mcp_oauth_lock_path(state_path: str) -> str:
+    return os.path.join(os.path.dirname(state_path), LOCK_FILENAME)
+
+
+@contextmanager
+def oauth_state_file_lock(state_path: str) -> Iterator[None]:
+    """Cross-process exclusive lock around read-merge-write of server_state.json."""
+    lock_path = mcp_oauth_lock_path(state_path)
+    parent = os.path.dirname(lock_path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except ImportError:
+            logger.warning(
+                "fcntl unavailable — OAuth state file lock is process-local only"
+            )
+        yield
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
 def write_mcp_oauth_state_atomic(path: str, payload: dict[str, Any]) -> None:
-    """Write JSON atomically with restrictive permissions."""
     parent = os.path.dirname(path)
     os.makedirs(parent, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=parent, prefix=".mcp_oauth_state_", suffix=".tmp")
@@ -68,6 +108,18 @@ def read_mcp_oauth_state(path: str) -> dict[str, Any] | None:
         return None
 
 
+def _prune_tombstones(
+    tombstones: dict[str, float], now: float, ttl: float = DEFAULT_TOMBSTONE_TTL_SECONDS
+) -> dict[str, float]:
+    return {k: ts for k, ts in tombstones.items() if ts + ttl >= now}
+
+
+def merge_dict(disk: dict, memory: dict) -> dict:
+    out = dict(disk)
+    out.update(memory)
+    return out
+
+
 def deserialize_state(
     raw: dict[str, Any],
 ) -> tuple[
@@ -78,13 +130,21 @@ def deserialize_state(
     dict[str, str],
     dict[str, dict[str, list[str]]],
     dict[str, dict[str, Any]],
+    dict[str, dict],
+    dict[str, AuthorizationCode],
+    dict[str, str],
+    dict[str, str],
+    dict[str, str],
+    dict[str, float],
+    dict[str, float],
 ]:
     """
-    Deserialize persisted OAuth state.
-
     Returns:
         clients, access_tokens, refresh_tokens, token_to_email,
-        refresh_lineage, lineage_index, replay_cache
+        refresh_lineage, lineage_index, replay_cache,
+        pending_authorizations, auth_codes, auth_code_to_email,
+        auth_code_to_id_token, user_id_tokens,
+        pending_tombstones, auth_code_tombstones
     """
     clients: dict[str, OAuthClientInformationFull] = {}
     access_tokens: dict[str, AccessToken] = {}
@@ -93,6 +153,30 @@ def deserialize_state(
     refresh_lineage: dict[str, str] = {}
     lineage_index: dict[str, dict[str, list[str]]] = {}
     replay_cache: dict[str, dict[str, Any]] = {}
+    pending_authorizations: dict[str, dict] = {}
+    auth_codes: dict[str, AuthorizationCode] = {}
+    auth_code_to_email: dict[str, str] = {}
+    auth_code_to_id_token: dict[str, str] = {}
+    user_id_tokens: dict[str, str] = {}
+    pending_tombstones: dict[str, float] = {}
+    auth_code_tombstones: dict[str, float] = {}
+
+    empty = (
+        clients,
+        access_tokens,
+        refresh_tokens,
+        token_to_email,
+        refresh_lineage,
+        lineage_index,
+        replay_cache,
+        pending_authorizations,
+        auth_codes,
+        auth_code_to_email,
+        auth_code_to_id_token,
+        user_id_tokens,
+        pending_tombstones,
+        auth_code_tombstones,
+    )
 
     version = raw.get("version")
     if version not in SUPPORTED_VERSIONS:
@@ -100,15 +184,25 @@ def deserialize_state(
             "Ignoring MCP OAuth state file: unsupported version %r",
             version,
         )
-        return (
-            clients,
-            access_tokens,
-            refresh_tokens,
-            token_to_email,
-            refresh_lineage,
-            lineage_index,
-            replay_cache,
-        )
+        return empty
+
+    now = time.time()
+    pending_tombstones = _prune_tombstones(
+        {
+            str(k): float(v)
+            for k, v in dict(raw.get("pending_tombstones") or {}).items()
+            if isinstance(v, (int, float))
+        },
+        now,
+    )
+    auth_code_tombstones = _prune_tombstones(
+        {
+            str(k): float(v)
+            for k, v in dict(raw.get("auth_code_tombstones") or {}).items()
+            if isinstance(v, (int, float))
+        },
+        now,
+    )
 
     for cid, cdata in (raw.get("clients") or {}).items():
         try:
@@ -153,6 +247,49 @@ def deserialize_state(
             except (KeyError, TypeError, ValueError) as e:
                 logger.warning("Skipping invalid replay-cache entry: %s", e)
 
+    saved_at = raw.get("saved_at")
+    pending_fallback_created_at = (
+        saved_at if isinstance(saved_at, (int, float)) else now
+    )
+    for state, pdata in (raw.get("pending_authorizations") or {}).items():
+        if state in pending_tombstones:
+            continue
+        if not isinstance(pdata, dict):
+            continue
+        entry = dict(pdata)
+        created_at = entry.get("created_at")
+        if not isinstance(created_at, (int, float)):
+            entry["created_at"] = pending_fallback_created_at
+            created_at = pending_fallback_created_at
+        if created_at + DEFAULT_PENDING_TTL_SECONDS < now:
+            continue
+        pending_authorizations[state] = entry
+
+    for code, cdata in (raw.get("auth_codes") or {}).items():
+        if code in auth_code_tombstones:
+            continue
+        try:
+            ac = AuthorizationCode.model_validate(cdata)
+            if ac.expires_at < now:
+                continue
+            auth_codes[code] = ac
+        except Exception as e:
+            logger.warning("Skipping invalid auth code entry: %s", e)
+
+    auth_code_to_email = {
+        k: v
+        for k, v in dict(raw.get("auth_code_to_email") or {}).items()
+        if k in auth_codes
+    }
+    auth_code_to_id_token = {
+        k: v
+        for k, v in dict(raw.get("auth_code_to_id_token") or {}).items()
+        if k in auth_codes
+    }
+    user_id_tokens = {
+        k: v for k, v in dict(raw.get("user_id_tokens") or {}).items() if isinstance(v, str)
+    }
+
     return (
         clients,
         access_tokens,
@@ -161,6 +298,13 @@ def deserialize_state(
         refresh_lineage,
         lineage_index,
         replay_cache,
+        pending_authorizations,
+        auth_codes,
+        auth_code_to_email,
+        auth_code_to_id_token,
+        user_id_tokens,
+        pending_tombstones,
+        auth_code_tombstones,
     )
 
 
@@ -172,21 +316,51 @@ def serialize_state(
     refresh_lineage: dict[str, str] | None = None,
     lineage_index: dict[str, dict[str, list[str]]] | None = None,
     replay_cache: dict[str, dict[str, Any]] | None = None,
+    pending_authorizations: dict[str, dict] | None = None,
+    auth_codes: dict[str, AuthorizationCode] | None = None,
+    auth_code_to_email: dict[str, str] | None = None,
+    auth_code_to_id_token: dict[str, str] | None = None,
+    user_id_tokens: dict[str, str] | None = None,
+    pending_tombstones: dict[str, float] | None = None,
+    auth_code_tombstones: dict[str, float] | None = None,
 ) -> dict[str, Any]:
+    now = time.time()
     refresh_lineage = refresh_lineage or {}
     lineage_index = lineage_index or {}
     replay_cache = replay_cache or {}
+    pending = dict(pending_authorizations or {})
+    codes = dict(auth_codes or {})
+    code_emails = dict(auth_code_to_email or {})
+    code_id_tokens = dict(auth_code_to_id_token or {})
+    id_tokens = dict(user_id_tokens or {})
+    pending_tombs = _prune_tombstones(dict(pending_tombstones or {}), now)
+    code_tombs = _prune_tombstones(dict(auth_code_tombstones or {}), now)
+
+    for k in pending_tombs:
+        pending.pop(k, None)
+    for k in code_tombs:
+        codes.pop(k, None)
+        code_emails.pop(k, None)
+        code_id_tokens.pop(k, None)
+
+    auth_codes_snap: dict[str, Any] = {}
+    for k, v in codes.items():
+        dumped = v.model_dump(mode="json")
+        if "redirect_uri" in dumped and not isinstance(dumped["redirect_uri"], str):
+            dumped["redirect_uri"] = str(v.redirect_uri)
+        auth_codes_snap[k] = dumped
+
     return {
         "version": STATE_VERSION,
-        "saved_at": time.time(),
+        "saved_at": now,
         "clients": {
-            k: v.model_dump(mode="json") for k, v in clients.items()
+            k: v.model_dump(mode="json") for k, v in dict(clients).items()
         },
         "access_tokens": {
-            k: v.model_dump(mode="json") for k, v in access_tokens.items()
+            k: v.model_dump(mode="json") for k, v in dict(access_tokens).items()
         },
         "refresh_tokens": {
-            k: v.model_dump(mode="json") for k, v in refresh_tokens.items()
+            k: v.model_dump(mode="json") for k, v in dict(refresh_tokens).items()
         },
         "token_to_email": dict(token_to_email),
         "refresh_lineage": dict(refresh_lineage),
@@ -211,6 +385,13 @@ def serialize_state(
             }
             for k, v in replay_cache.items()
         },
+        "pending_authorizations": pending,
+        "auth_codes": auth_codes_snap,
+        "auth_code_to_email": code_emails,
+        "auth_code_to_id_token": code_id_tokens,
+        "user_id_tokens": id_tokens,
+        "pending_tombstones": pending_tombs,
+        "auth_code_tombstones": code_tombs,
     }
 
 
@@ -221,9 +402,13 @@ def prune_expired(
     refresh_lineage: dict[str, str] | None = None,
     lineage_index: dict[str, dict[str, list[str]]] | None = None,
     replay_cache: dict[str, dict[str, Any]] | None = None,
+    pending_authorizations: dict[str, dict] | None = None,
+    auth_codes: dict[str, AuthorizationCode] | None = None,
+    auth_code_to_email: dict[str, str] | None = None,
+    auth_code_to_id_token: dict[str, str] | None = None,
     now: float | None = None,
 ) -> None:
-    """Remove expired MCP access/refresh tokens, replay entries, and orphans."""
+    """Remove expired MCP tokens, replay entries, pending states, auth codes."""
     t = now if now is not None else time.time()
 
     for key, at in list(access_tokens.items()):
@@ -261,12 +446,34 @@ def prune_expired(
                 or any(at in live_access for at in at_list)
             )
             if not family_active:
-                # Family is fully dead; drop its lineage entries so we don't
-                # leak memory remembering rotations of long-gone tokens.
                 for rt in rt_list:
                     refresh_lineage.pop(rt, None)
                 lineage_index.pop(fam, None)
             else:
-                # Drop dead access tokens but keep refresh-token history so we
-                # can still detect reuse of rotated tokens within the family.
                 entry["access_tokens"] = [at for at in at_list if at in live_access]
+
+    if pending_authorizations is not None:
+        for state, pdata in list(pending_authorizations.items()):
+            created_at = pdata.get("created_at") if isinstance(pdata, dict) else None
+            if not isinstance(created_at, (int, float)):
+                pending_authorizations.pop(state, None)
+                continue
+            if created_at + DEFAULT_PENDING_TTL_SECONDS < t:
+                pending_authorizations.pop(state, None)
+
+    if auth_codes is not None:
+        for code, ac in list(auth_codes.items()):
+            if ac.expires_at < t:
+                auth_codes.pop(code, None)
+                if auth_code_to_email is not None:
+                    auth_code_to_email.pop(code, None)
+                if auth_code_to_id_token is not None:
+                    auth_code_to_id_token.pop(code, None)
+        if auth_code_to_email is not None:
+            for code in list(auth_code_to_email.keys()):
+                if code not in auth_codes:
+                    auth_code_to_email.pop(code, None)
+        if auth_code_to_id_token is not None:
+            for code in list(auth_code_to_id_token.keys()):
+                if code not in auth_codes:
+                    auth_code_to_id_token.pop(code, None)
